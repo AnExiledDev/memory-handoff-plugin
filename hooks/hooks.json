@@ -1,0 +1,4 @@
+{
+  "description": "Memory extraction from the transcript a compaction is about to replace",
+  "modules": ["module.js"]
+}

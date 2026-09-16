@@ -1,0 +1,24 @@
+{
+  "name": "memory-handoff",
+  "description": "The memory-handoff plugin, distributed from its own repository",
+  "owner": {
+    "name": "AnExiledDev",
+    "email": "696222+AnExiledDev@users.noreply.github.com",
+    "url": "https://github.com/AnExiledDev"
+  },
+  "plugins": [
+    {
+      "name": "memory-handoff",
+      "source": "./",
+      "description": "Turns the conversation a compaction is about to throw away into durable memories",
+      "author": {
+        "name": "AnExiledDev",
+        "email": "696222+AnExiledDev@users.noreply.github.com"
+      },
+      "homepage": "https://github.com/AnExiledDev/memory-handoff-plugin",
+      "repository": "https://github.com/AnExiledDev/memory-handoff-plugin",
+      "license": "MIT",
+      "keywords": ["memory", "compaction", "context", "function-hooks", "session"]
+    }
+  ]
+}

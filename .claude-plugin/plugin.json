@@ -1,0 +1,10 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "memory-handoff",
+  "version": "0.1.0",
+  "description": "Turns the conversation a compaction is about to throw away into durable memories",
+  "author": {
+    "name": "AnExiledDev",
+    "email": "696222+AnExiledDev@users.noreply.github.com"
+  }
+}
