@@ -11,12 +11,14 @@
  *
  * **Exactly one fork per compaction.** compact-handoff answers `session.compact`
  * without calling `next`, so a plugin keyed after it in `enabledPlugins` never
- * sees the event at all. It offers a seam instead: `$.compactHandoff.beforeCompact`
- * fires with the same pre-compaction transcript, beside its own fork. When that
- * seam is there this module subscribes at `session.start` and its own
- * `session.compact` hook forks nothing, so the two installs together still pay
- * for one memory fork. When the seam is absent the hook does the fork itself.
- * The row says which path carried it, `via: "seam"` or `via: "hook"`.
+ * sees the event at all. It offers a seam instead: this module hands it the name
+ * of a tool at `session.start`, and one compaction before it happens
+ * compact-handoff raises that tool, so the generation runs here beside its own
+ * fork over the same pre-compaction transcript. When the seam is there this
+ * module's own `session.compact` hook forks nothing, so the two installs
+ * together still pay for one memory fork. When the seam is absent the hook does
+ * the fork itself. The row says which path carried it, `via: "seam"` or
+ * `via: "hook"`.
  *
  * **It never answers a compaction.** Every `session.compact` dispatch ends in
  * `next(e)`, whatever happened here, so the compaction you already had is what
@@ -44,6 +46,25 @@ importance runs 1 (minor) to 5 (would waste an hour to rediscover). Ten memories
 
 /** Whether this session reached the transcript through compact-handoff's seam. */
 const SEAM_KEY = "seam";
+
+/**
+ * The tool compact-handoff raises when a compaction is about to happen, and the
+ * whole of the seam between the two plugins.
+ *
+ * The seam carries strings. A callback cannot cross a plugin boundary here at
+ * all: each plugin runs in its own environment, an interface call's arguments
+ * go through `cloneInto`, and `cloneInto` throws `DataCloneError` on a function.
+ * So compact-handoff is handed this name and raises it, the raise lands on the
+ * hook below, and the generation runs in this plugin's environment where a fork
+ * works the way it does everywhere else.
+ *
+ * It is deliberately NOT `$.tool.register`ed. The raise is for one hook of one
+ * plugin and the model has no business calling it, so registering it would put
+ * a tool nobody should use in every prompt. Whether a raise reaches a hook for
+ * an unregistered tool is unverified on a live engine: if it comes back refused,
+ * registering it with a description saying it is internal is the fallback.
+ */
+const SEAM_TOOL = "mcp__memory-handoff__before_compact";
 
 /** How many compactions this session has generated from, for the filename. */
 const DEPTH_KEY = "depth";
@@ -74,6 +95,19 @@ export const register = (on) => {
         return { result: JSON.stringify(await statusReport($), null, 2) };
     });
 
+    // compact-handoff raising the seam, one compaction before it happens. It
+    // never calls `next`: this call exists for this hook and for nothing else,
+    // and the answer goes back on compact-handoff's own row.
+    on("tool.call", { tool: SEAM_TOOL }, async ($, e) => {
+        const record = await safely($, () => generate($, seamAbout(e), "seam"));
+
+        if (record === null) {
+            return { result: { outcome: "threw", n: null, elapsedMs: null } };
+        }
+
+        return { result: { outcome: record.outcome, n: record.n, elapsedMs: record.elapsedMs } };
+    });
+
     // A precompute is the engine building a compaction it may never use, so
     // nothing here spends on it. It is handed on rather than declined: this
     // plugin answers no compaction, and a `{ skip }` from here would change how
@@ -91,31 +125,61 @@ export const register = (on) => {
             return next(e);
         }
 
-        await safely($, () => generate($, e, "hook"));
+        await safely($, () => generate($, hookAbout(e), "hook"));
 
         return next(e);
     });
 };
 
 /**
+ * What a generation needs to know about the compaction it is reading, from the
+ * two events that carry it.
+ *
+ * The raise carries a count because the messages themselves cannot cross the
+ * boundary; the hook has the messages in hand. Either way the fork reads the
+ * live session rather than anything passed in, so the count is a row field and
+ * never an input to the work.
+ */
+const seamAbout = (e) => ({
+    trigger: typeof e?.trigger === "string" ? e.trigger : null,
+    agentId: e?.agentId ?? null,
+    messagesIn: typeof e?.messageCount === "number" ? e.messageCount : null,
+});
+
+const hookAbout = (e) => ({
+    trigger: e?.trigger ?? null,
+    agentId: e?.agentId ?? null,
+    messagesIn: Array.isArray(e?.messages) ? e.messages.length : null,
+});
+
+/**
  * Subscribes to compact-handoff when it is there, and records either way.
  *
- * The check is the one the contract names, `typeof $.compactHandoff?.beforeCompact`,
- * and it runs at `session.start` because that is the first event after the
+ * The calls are written out longhand and wrapped, because that is the only
+ * spelling the engine's static scan takes: `$` is `$.noun.event(...)` at the
+ * call site, and a noun read, bound or optionally chained is refused at load
+ * ("$.<noun> is used as a value"). So there is no `typeof` check and no
+ * optionally chained read of the noun, which is what refused 0.1.0 at load.
+ * With compact-handoff absent there is no such noun, reading it throws a
+ * TypeError, and that throw is the detection.
+ *
+ * It runs at `session.start` because that is the first event after the
  * `engine.create` fold that adds the noun.
  */
 const subscribeToSeam = async ($) => {
-    const seam = $.compactHandoff;
+    let reading = null;
 
-    if (typeof seam?.beforeCompact !== "function") {
-        await $.store.set(SEAM_KEY, { present: false, at: Date.now() });
+    try {
+        await $.compactHandoff.beforeCompact({ tool: SEAM_TOOL, name: "memory-handoff" });
 
-        return;
+        const version = await $.compactHandoff.version();
+
+        reading = { present: true, version, detail: null, at: Date.now() };
+    } catch (error) {
+        reading = { present: false, version: null, detail: String(error).slice(0, MAX_DETAIL_CHARS), at: Date.now() };
     }
 
-    seam.beforeCompact((event) => generate($, event, "seam"), { name: "memory-handoff" });
-
-    await $.store.set(SEAM_KEY, { present: true, version: seam.version ?? null, at: Date.now() });
+    await safely($, () => $.store.set(SEAM_KEY, reading));
 };
 
 /**
@@ -125,7 +189,7 @@ const subscribeToSeam = async ($) => {
  * including the paths that spent nothing. A generation that fails is a row with
  * an outcome on it.
  */
-const generate = async ($, e, via) => {
+const generate = async ($, about, via) => {
     const startedAt = Date.now();
     const usage = await safely($, () => $.session.usage());
     const record = {
@@ -137,9 +201,9 @@ const generate = async ($, e, via) => {
         cwd: await safely($, () => $.session.cwd()),
         model: await safely($, () => $.session.model()),
         modelRequested: await modelAlias($),
-        trigger: e?.trigger ?? null,
-        agentId: e?.agentId ?? null,
-        messagesIn: Array.isArray(e?.messages) ? e.messages.length : null,
+        trigger: about.trigger,
+        agentId: about.agentId,
+        messagesIn: about.messagesIn,
         context: usage?.context ?? null,
         plugin: await pluginVersion($),
         engine: (await safely($, () => $.env.get("CLAUDE_CODE_VERSION"))) ?? null,

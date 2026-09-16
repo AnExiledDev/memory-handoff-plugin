@@ -1,7 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { compactInput, fakeApi, fakeRuntime, fakeSeam, forkReply, passThrough } from "./fixtures.js";
+import { readFileSync } from "node:fs";
+
+import { SEAM_TOOL, compactInput, fakeApi, fakeRuntime, fakeSeam, forkReply, passThrough } from "./fixtures.js";
 
 // `node --check` reads module.js as a script and never sees an `await` in a
 // non-async arrow, so importing it is the only cheap parse that matches how the
@@ -31,20 +33,57 @@ const started = async (host) => {
 };
 
 describe("beside compact-handoff, the seam carries the compaction", () => {
-    it("subscribes under its own name at session.start", async () => {
+    it("hands compact-handoff a tool name at session.start and records the reading", async () => {
         const seam = fakeSeam();
         const host = fakeApi({ seam: seam.noun });
 
         await started(host);
 
         assert.equal(seam.subscribers.length, 1);
+        assert.equal(seam.subscribers[0].tool, SEAM_TOOL);
         assert.equal(seam.subscribers[0].name, "memory-handoff");
-        assert.equal(host.store.get("seam").present, true);
-        assert.equal(host.store.get("seam").version, "0.4.3");
+        assert.deepEqual(host.store.get("seam"), {
+            present: true,
+            version: "0.6.0",
+            detail: null,
+            at: host.store.get("seam").at,
+        });
+    });
+
+    // Reading a noun that is not there throws, and that throw is the whole of
+    // the detection: there is no `typeof` check, because the engine's static
+    // scan refuses a noun of `$` read as a value.
+    it("records the seam as absent when the noun is not on $", async () => {
+        const host = fakeApi();
+
+        await started(host);
+
+        const reading = host.store.get("seam");
+
+        assert.equal(reading.present, false);
+        assert.equal(reading.version, null);
+        assert.equal(typeof reading.detail, "string");
+        assert.ok(reading.detail.length > 0);
+    });
+
+    it("records the seam as absent when subscribing throws", async () => {
+        const host = fakeApi({
+            seam: {
+                beforeCompact: async () => {
+                    throw new Error("no room for another subscriber");
+                },
+                version: async () => "0.6.0",
+            },
+        });
+
+        await started(host);
+
+        assert.equal(host.store.get("seam").present, false);
+        assert.match(host.store.get("seam").detail, /no room/u);
     });
 
     // The double spend the seam exists to prevent: if this plugin is outermost
-    // it sees the event first, and must leave the fork to the seam call.
+    // it sees the event first, and must leave the fork to the raise.
     it("forks nothing in its own hook and still calls next", async () => {
         const seam = fakeSeam();
         let forks = 0;
@@ -66,7 +105,7 @@ describe("beside compact-handoff, the seam carries the compaction", () => {
         assert.equal(next.calls.length, 1);
     });
 
-    it("forks once when the seam fires, and the row says so", async () => {
+    it("forks once when the tool is raised, and the row says so", async () => {
         const seam = fakeSeam();
         let forks = 0;
         const host = fakeApi({
@@ -78,8 +117,9 @@ describe("beside compact-handoff, the seam carries the compaction", () => {
             },
         });
 
-        await started(host);
-        await seam.fire(compactInput());
+        const runtime = await started(host);
+
+        await seam.raise(runtime, host.$, { trigger: "auto", messageCount: 412 });
 
         const rows = host.rowsIn("index.jsonl");
 
@@ -88,6 +128,51 @@ describe("beside compact-handoff, the seam carries the compaction", () => {
         assert.equal(rows[0].via, "seam");
         assert.equal(rows[0].outcome, "extracted");
         assert.equal(rows[0].candidates, 3);
+        // The messages cannot cross the boundary, so the count is what the
+        // raise carries and the fork reads the live session itself.
+        assert.equal(rows[0].trigger, "auto");
+        assert.equal(rows[0].messagesIn, 412);
+    });
+
+    it("answers the raise with what happened and never calls next", async () => {
+        const seam = fakeSeam();
+        const host = fakeApi({ seam: seam.noun });
+        const runtime = await started(host);
+        const next = passThrough();
+
+        await runtime.dispatch("session.start", host.$, {}, passThrough());
+
+        const answer = await runtime.dispatch(
+            "tool.call",
+            host.$,
+            { tool: SEAM_TOOL, trigger: "manual", messageCount: 2 },
+            next,
+        );
+
+        assert.equal(answer.result.outcome, "extracted");
+        assert.equal(typeof answer.result.n, "number");
+        assert.equal(typeof answer.result.elapsedMs, "number");
+        assert.equal(next.calls.length, 0);
+    });
+
+    it("answers the raise even when the generation throws", async () => {
+        const seam = fakeSeam();
+        const host = fakeApi({
+            seam: seam.noun,
+            session: {
+                usage: async () => {
+                    throw new Error("nothing answers here");
+                },
+            },
+            fork: async () => {
+                throw new Error("the model said no");
+            },
+        });
+        const runtime = await started(host);
+
+        const answer = await seam.raise(runtime, host.$);
+
+        assert.equal(answer.result.outcome, "threw");
     });
 });
 
@@ -309,5 +394,33 @@ describe("memory_status", () => {
         assert.equal(report.dir, "/home/nobody/.claude/memory-handoff");
         assert.equal(report.seam.present, false);
         assert.equal(report.last.via, "hook");
+    });
+});
+
+// Every pattern here is a spelling the engine's static scan refuses, measured
+// against module.js as text because the refusal happens before the module is
+// ever loaded. 0.1.0 was refused at load for the first and the third.
+describe("the module is spelled the way the engine's scan takes", () => {
+    const moduleSource = readFileSync(new URL("../hooks/module.js", import.meta.url), "utf8");
+
+    it("never optionally chains a noun of $", () => {
+        // "$.<noun> is used as a value": `$.compactHandoff?.beforeCompact`.
+        assert.equal(/\$\.[A-Za-z_$][\w$]*\?\./u.test(moduleSource), false);
+    });
+
+    it("never reaches a noun of $ by computed key", () => {
+        // The scan reads `$.noun.event` literally, so `$["noun"]` is refused.
+        assert.equal(/\$\[/u.test(moduleSource), false);
+    });
+
+    it("never binds, passes or returns a noun of $ as a value", () => {
+        // `const seam = $.compactHandoff;` and `f($.store)` both refuse.
+        assert.equal(/\$\.[A-Za-z_$][\w$]*\s*[;,)]/u.test(moduleSource), false);
+    });
+
+    it("raises the seam tool by its literal name", () => {
+        // The runtime allowlist is built from literal calls, and the tool this
+        // plugin answers must be the one compact-handoff was handed.
+        assert.match(moduleSource, /"mcp__memory-handoff__before_compact"/u);
     });
 });

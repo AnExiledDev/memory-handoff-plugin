@@ -82,15 +82,42 @@ does not depend on the order.
 the pre-compaction transcript, writes its row, and returns `next(e)` so the
 engine compacts exactly as it always did. The row records `via: "hook"`.
 
-**Together**, compact-handoff exposes a seam, `$.compactHandoff.beforeCompact(fn,
-{ name })`, that fires with the same event right beside its own fork. This
-plugin looks for that seam at `session.start` and subscribes to it when it is
-there, and its own `session.compact` hook then forks nothing even if it happens
-to be outermost. One compaction is one memory fork either way. The row records
-`via: "seam"`, and compact-handoff's own row records the subscriber's name,
-outcome and elapsed ms beside it. A subscriber that throws changes nothing for
-compact-handoff, and one still pending after its timeout is abandoned so the
-compaction is never held up.
+**Together**, compact-handoff exposes a seam, and the seam carries strings.
+At `session.start` this plugin hands it the name of a tool:
+
+```js
+await $.compactHandoff.beforeCompact({
+    tool: "mcp__memory-handoff__before_compact",
+    name: "memory-handoff",
+});
+```
+
+One compaction before it happens, compact-handoff raises that tool with
+`$.tool.call({ tool, trigger, messageCount })`. The raise lands on this plugin's
+own `tool.call` hook, so the fork and the row happen here, in this plugin's own
+environment, beside compact-handoff's fork over the same pre-compaction
+transcript. This plugin's own `session.compact` hook then forks nothing even if
+it happens to be outermost. One compaction is one memory fork either way.
+
+A callback would have been simpler to read and it cannot cross this boundary at
+all. Each plugin runs in its own environment, an interface call's arguments go
+through `cloneInto`, and `cloneInto` throws `DataCloneError` on a function. The
+transcript does not travel either, which is why the raise carries
+`messageCount` and the fork reads the live session itself.
+
+The row records `via: "seam"` and `messagesIn` from the count the raise carried,
+and compact-handoff's own row records this plugin's name, tool, outcome and
+elapsed ms beside it. A raise that throws changes nothing for compact-handoff,
+and one still pending after its timeout is abandoned so the compaction is never
+held up.
+
+**Which path ran is on the row.** `via: "seam"` means compact-handoff raised the
+tool and this plugin's `session.compact` hook did nothing; `via: "hook"` means
+this plugin took the compaction itself. `mcp__memory-handoff__memory_status`
+answers with the same reading before any compaction has happened: its `seam`
+field is `{ present: true, version }` when the subscription went through, and
+`{ present: false, detail }` with the error that says so when compact-handoff is
+not installed.
 
 Two things the seam deliberately does not carry. A subagent's compaction is
 passed through by compact-handoff without calling subscribers, so it reaches
@@ -194,5 +221,12 @@ stores its answer. It does not remember anything for you yet.
   check ran before the noun existed, falls back to this plugin's own hook. That
   is safe, since the seam flag is what the hook checks, and the worst case is a
   fork that never happens because compact-handoff answered first.
+- `mcp__memory-handoff__before_compact` is deliberately not registered with
+  `$.tool.register`. It exists for one hook of one plugin and the model has no
+  business calling it, so registering it would put a tool nobody should use in
+  every prompt. Whether the engine delivers a raise for an unregistered tool is
+  unverified on a live engine. If the raise comes back refused, registering it
+  with a description saying it is internal is the fallback, and the `seam` field
+  on `memory_status` is where you would see it.
 - Nothing prunes `~/.claude/memory-handoff/`. It grows by one row and one small
   JSON file per compaction, forever, until you delete it.

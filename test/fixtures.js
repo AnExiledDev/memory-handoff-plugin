@@ -92,26 +92,44 @@ export const forkReply = (memories = 2) => ({
     },
 });
 
+/** The tool compact-handoff raises, and the whole of the seam between them. */
+export const SEAM_TOOL = "mcp__memory-handoff__before_compact";
+
 /**
- * compact-handoff's seam, as the contract describes it: subscribers are called
- * with the same event, concurrently with its own fork, and a thrown subscriber
- * changes nothing for the caller.
+ * compact-handoff's seam, as the contract describes it: a noun on `$` taking a
+ * tool name, and a raise of that tool when a compaction is about to happen.
+ *
+ * Nothing but strings crosses it. `raise` goes through the runtime exactly as
+ * `$.tool.call` does, because the hook that answers is the one registered for
+ * that tool name and nothing else reaches it.
  */
-export const fakeSeam = (version = "0.4.3") => {
+export const fakeSeam = (version = "0.6.0") => {
     const subscribers = [];
 
     return {
         subscribers,
         noun: {
-            version,
-            beforeCompact: (fn, options = {}) => {
-                subscribers.push({ fn, name: options.name ?? "anonymous" });
+            beforeCompact: async (options) => {
+                const tool = options?.tool;
 
-                return () => void subscribers.splice(subscribers.findIndex((entry) => entry.fn === fn), 1);
+                subscribers.push({ tool, name: options?.name ?? tool });
+
+                return { subscribed: true, tool };
             },
+            version: async () => version,
         },
-        /** Fire the seam the way a real compaction would. */
-        fire: async (event) => Promise.allSettled(subscribers.map((entry) => entry.fn(event))),
+        /** Raise the subscribed tool the way compact-handoff's dispatch does. */
+        raise: async (runtime, $, event = {}) =>
+            runtime.dispatch(
+                "tool.call",
+                $,
+                {
+                    tool: subscribers.at(-1)?.tool ?? SEAM_TOOL,
+                    trigger: event.trigger ?? "manual",
+                    messageCount: event.messageCount ?? 2,
+                },
+                passThrough(),
+            ),
     };
 };
 
