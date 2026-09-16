@@ -99,6 +99,16 @@ environment, beside compact-handoff's fork over the same pre-compaction
 transcript. This plugin's own `session.compact` hook then forks nothing even if
 it happens to be outermost. One compaction is one memory fork either way.
 
+**`before_compact` is a registered tool, and the model can see it.** Leaving it
+unregistered was tried first, on the grounds that it is for one hook of one
+plugin. The engine refused the raise: `no tool named
+"mcp__memory-handoff__before_compact" in this session`, measured on 2.1.273. A
+tool has to be registered to be raised, there is no way to register one the
+model cannot see, so its description says what it is for and the hook denies any
+call that does not carry both `trigger` and `messageCount`. A denied call writes
+a row with `outcome: "denied"`, which is how you would notice the model reaching
+for it.
+
 A callback would have been simpler to read and it cannot cross this boundary at
 all. Each plugin runs in its own environment, an interface call's arguments go
 through `cloneInto`, and `cloneInto` throws `DataCloneError` on a function. The
@@ -161,9 +171,16 @@ at 2.1.273 against a declaration saying it returns a number, and subtracting a
 Promise gives you `NaN` which serialises as `null`. That cost compact-handoff 65
 of its first 66 rows.
 
-`mcp__memory-handoff__memory_status` is the one registered tool, and it answers
-with the row count, the most recent row, whether the plugin is live, where the
-data is, and whether it is reading compactions through the seam or its own hook.
+Two tools are registered. `mcp__memory-handoff__memory_status` answers with the
+row count, the most recent row, whether the plugin is live, where the data is,
+and whether it is reading compactions through the seam or its own hook.
+`mcp__memory-handoff__before_compact` is the seam's raise and is described
+above; calling it yourself gets you a denial and a row.
+
+A seam row also carries `raise: { keys, hasToolUseId }`, the field names the
+engine built the raise out of and whether it filled in a `tool_use_id`. That is
+there to answer what a plugin's `$.tool.call` looks like beside the model's own
+call, which the declarations leave open.
 
 ## Settings
 
@@ -221,12 +238,9 @@ stores its answer. It does not remember anything for you yet.
   check ran before the noun existed, falls back to this plugin's own hook. That
   is safe, since the seam flag is what the hook checks, and the worst case is a
   fork that never happens because compact-handoff answered first.
-- `mcp__memory-handoff__before_compact` is deliberately not registered with
-  `$.tool.register`. It exists for one hook of one plugin and the model has no
-  business calling it, so registering it would put a tool nobody should use in
-  every prompt. Whether the engine delivers a raise for an unregistered tool is
-  unverified on a live engine. If the raise comes back refused, registering it
-  with a description saying it is internal is the fallback, and the `seam` field
-  on `memory_status` is where you would see it.
+- `mcp__memory-handoff__before_compact` sits in every prompt's tool list, and
+  nothing here can hide it. The engine will not raise a tool it has never been
+  told about, and `$.tool.register` has no option for a tool the model cannot
+  see. The cost is one line of tool listing; the guard is the deny rule above.
 - Nothing prunes `~/.claude/memory-handoff/`. It grows by one row and one small
   JSON file per compaction, forever, until you delete it.

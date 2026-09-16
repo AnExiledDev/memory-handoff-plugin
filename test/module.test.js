@@ -132,6 +132,7 @@ describe("beside compact-handoff, the seam carries the compaction", () => {
         // raise carries and the fork reads the live session itself.
         assert.equal(rows[0].trigger, "auto");
         assert.equal(rows[0].messagesIn, 412);
+        assert.deepEqual(rows[0].raise.keys, ["tool", "trigger", "messageCount"]);
     });
 
     it("answers the raise with what happened and never calls next", async () => {
@@ -153,6 +154,71 @@ describe("beside compact-handoff, the seam carries the compaction", () => {
         assert.equal(typeof answer.result.n, "number");
         assert.equal(typeof answer.result.elapsedMs, "number");
         assert.equal(next.calls.length, 0);
+    });
+
+    // Live run C: with the tool unregistered the engine refused the raise with
+    // `no tool named "mcp__memory-handoff__before_compact" in this session`, so
+    // registering it is not optional. There is no way to hide it from the model.
+    it("registers the raised tool at session.start, with the seam fields required", async () => {
+        const host = fakeApi({ seam: fakeSeam().noun });
+
+        await started(host);
+
+        const spec = host.tools.find((entry) => entry.name === "before_compact");
+
+        assert.equal(typeof spec.description, "string");
+        assert.match(spec.description, /compact-handoff/u);
+        assert.deepEqual(spec.inputSchema.required, ["trigger", "messageCount"]);
+        assert.deepEqual(Object.keys(spec.inputSchema.properties), ["trigger", "messageCount"]);
+    });
+
+    it("denies a call that does not carry the seam fields, and says so on a row", async () => {
+        let forks = 0;
+        const host = fakeApi({
+            seam: fakeSeam().noun,
+            fork: async () => {
+                forks += 1;
+
+                return forkReply();
+            },
+        });
+        const runtime = await started(host);
+
+        const answer = await runtime.dispatch(
+            "tool.call",
+            host.$,
+            { tool: SEAM_TOOL, tool_use_id: "toolu_1" },
+            passThrough(),
+        );
+
+        const rows = host.rowsIn("index.jsonl");
+
+        assert.match(answer.deny, /not a tool for the model/u);
+        assert.equal(answer.result, undefined);
+        assert.equal(forks, 0);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].outcome, "denied");
+        assert.equal(rows[0].via, "seam");
+    });
+
+    it("records what the engine filled in on the raise", async () => {
+        const seam = fakeSeam();
+        const host = fakeApi({ seam: seam.noun });
+        const runtime = await started(host);
+
+        await runtime.dispatch(
+            "tool.call",
+            host.$,
+            { tool: SEAM_TOOL, tool_use_id: "toolu_2", trigger: "manual", messageCount: 9, messages: [1, 2] },
+            passThrough(),
+        );
+
+        const row = host.rowsIn("index.jsonl")[0];
+
+        assert.equal(row.raise.hasToolUseId, true);
+        // The messages never travel, so the field is dropped rather than
+        // counted: the row is a note about the raise, not a copy of it.
+        assert.deepEqual(row.raise.keys, ["tool", "tool_use_id", "trigger", "messageCount"]);
     });
 
     it("answers the raise even when the generation throws", async () => {
@@ -369,7 +435,7 @@ describe("memory_status", () => {
 
         assert.deepEqual(
             host.tools.map((spec) => spec.name),
-            ["memory_status"],
+            ["before_compact", "memory_status"],
         );
 
         await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());

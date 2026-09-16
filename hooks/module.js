@@ -58,11 +58,13 @@ const SEAM_KEY = "seam";
  * hook below, and the generation runs in this plugin's environment where a fork
  * works the way it does everywhere else.
  *
- * It is deliberately NOT `$.tool.register`ed. The raise is for one hook of one
- * plugin and the model has no business calling it, so registering it would put
- * a tool nobody should use in every prompt. Whether a raise reaches a hook for
- * an unregistered tool is unverified on a live engine: if it comes back refused,
- * registering it with a description saying it is internal is the fallback.
+ * It has to be registered. Leaving it out was tried first, because the model
+ * has no business calling it, and the engine refused the raise outright:
+ * `HooksError: compact-handoff: $.tool.call: no tool named
+ * "mcp__memory-handoff__before_compact" in this session` (live run C, engine
+ * 2.1.273). There is no way to register a tool the model cannot see, so it is
+ * registered with a description saying what it is for, and the hook denies any
+ * call that does not carry compact-handoff's fields.
  */
 const SEAM_TOOL = "mcp__memory-handoff__before_compact";
 
@@ -99,7 +101,17 @@ export const register = (on) => {
     // never calls `next`: this call exists for this hook and for nothing else,
     // and the answer goes back on compact-handoff's own row.
     on("tool.call", { tool: SEAM_TOOL }, async ($, e) => {
-        const record = await safely($, () => generate($, seamAbout(e), "seam"));
+        const about = seamAbout(e);
+
+        // The tool is registered, so the model can see it and will sometimes
+        // try it. Only compact-handoff's raise carries both of these.
+        if (about.trigger === null || about.messagesIn === null) {
+            await safely($, () => refuseRaise($, about));
+
+            return { deny: DENY_REASON };
+        }
+
+        const record = await safely($, () => generate($, about, "seam"));
 
         if (record === null) {
             return { result: { outcome: "threw", n: null, elapsedMs: null } };
@@ -144,13 +156,39 @@ const seamAbout = (e) => ({
     trigger: typeof e?.trigger === "string" ? e.trigger : null,
     agentId: e?.agentId ?? null,
     messagesIn: typeof e?.messageCount === "number" ? e.messageCount : null,
+    raise: raiseShape(e),
 });
 
 const hookAbout = (e) => ({
     trigger: e?.trigger ?? null,
     agentId: e?.agentId ?? null,
     messagesIn: Array.isArray(e?.messages) ? e.messages.length : null,
+    raise: null,
 });
+
+/**
+ * What the engine filled in on the raise, in two small fields.
+ *
+ * A plugin's `$.tool.call` and the model's own call arrive at the same hook,
+ * and how much of a tool call the engine builds for a raise is not documented:
+ * the declarations say `tool_use_id` is on every `tool.call` input. Recording
+ * the key names and whether that id was there is how the next version finds
+ * out, and it costs a row field.
+ */
+const raiseShape = (e) => ({
+    keys: Object.keys(e ?? {}).filter((key) => key !== "messages"),
+    hasToolUseId: typeof e?.tool_use_id === "string",
+});
+
+/** Why a call that is not compact-handoff's raise is refused. */
+const DENY_REASON = "before_compact is raised by compact-handoff at compaction; it is not a tool for the model";
+
+/** A refused call is a row too, so a model reaching for it is visible. */
+const refuseRaise = async ($, about) => {
+    const startedAt = Date.now();
+
+    return finish($, await blankRecord($, about, "seam"), "denied", startedAt);
+};
 
 /**
  * Subscribes to compact-handoff when it is there, and records either way.
@@ -191,30 +229,7 @@ const subscribeToSeam = async ($) => {
  */
 const generate = async ($, about, via) => {
     const startedAt = Date.now();
-    const usage = await safely($, () => $.session.usage());
-    const record = {
-        at: new Date().toISOString(),
-        n: await nextDepth($),
-        via,
-        live: await isLive($),
-        sessionId: await safely($, () => $.session.id()),
-        cwd: await safely($, () => $.session.cwd()),
-        model: await safely($, () => $.session.model()),
-        modelRequested: await modelAlias($),
-        trigger: about.trigger,
-        agentId: about.agentId,
-        messagesIn: about.messagesIn,
-        context: usage?.context ?? null,
-        plugin: await pluginVersion($),
-        engine: (await safely($, () => $.env.get("CLAUDE_CODE_VERSION"))) ?? null,
-        outcome: "",
-        detail: "",
-        usage: null,
-        replyChars: null,
-        candidates: null,
-        replyFile: null,
-        elapsedMs: null,
-    };
+    const record = await blankRecord($, about, via);
 
     // A subagent's compaction is a different conversation with a different
     // owner, and a subagent is not a memory source yet. compact-handoff does
@@ -247,6 +262,39 @@ const generate = async ($, about, via) => {
 
         return finish($, record, "threw", startedAt);
     }
+};
+
+/**
+ * Everything a row knows before the work happens, for the two paths that write
+ * one: a generation, and a call this plugin refused.
+ */
+const blankRecord = async ($, about, via) => {
+    const usage = await safely($, () => $.session.usage());
+
+    return {
+        at: new Date().toISOString(),
+        n: await nextDepth($),
+        via,
+        live: await isLive($),
+        sessionId: await safely($, () => $.session.id()),
+        cwd: await safely($, () => $.session.cwd()),
+        model: await safely($, () => $.session.model()),
+        modelRequested: await modelAlias($),
+        trigger: about.trigger,
+        agentId: about.agentId,
+        messagesIn: about.messagesIn,
+        raise: about.raise,
+        context: usage?.context ?? null,
+        plugin: await pluginVersion($),
+        engine: (await safely($, () => $.env.get("CLAUDE_CODE_VERSION"))) ?? null,
+        outcome: "",
+        detail: "",
+        usage: null,
+        replyChars: null,
+        candidates: null,
+        replyFile: null,
+        elapsedMs: null,
+    };
 };
 
 /** Stamps the outcome and the clock on the row, appends it, and hands it back. */
@@ -370,6 +418,22 @@ const nextDepth = async ($) => {
 };
 
 const registerTools = async ($) => {
+    // Registered because the engine will not raise a tool it has never been
+    // told about, which is the whole of why this is here rather than hidden.
+    // The description is written for the model that will read it in every
+    // prompt, and the hook denies anything that is not compact-handoff's raise.
+    await $.tool.register({
+        name: "before_compact",
+        description:
+            "Internal to the compact-handoff seam. compact-handoff raises this at compaction; it is not for the " +
+            "model, and a call without the seam fields is denied.",
+        inputSchema: {
+            type: "object",
+            properties: { trigger: { type: "string" }, messageCount: { type: "number" } },
+            required: ["trigger", "messageCount"],
+        },
+    });
+
     await $.tool.register({
         name: "memory_status",
         description:
