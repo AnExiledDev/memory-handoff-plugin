@@ -271,7 +271,7 @@ describe("alone, the plugin's own session.compact hook carries it", () => {
         assert.deepEqual(answer, { passedThrough: true });
     });
 
-    it("spends nothing on a precompute and passes it through", async () => {
+    it("spends nothing on a precompute, records the skip, and passes it through", async () => {
         let forks = 0;
         const host = fakeApi({
             fork: async () => {
@@ -285,8 +285,11 @@ describe("alone, the plugin's own session.compact hook carries it", () => {
 
         const answer = await runtime.dispatch("session.compact", host.$, compactInput({ trigger: "precompute" }), next);
 
+        const rows = host.rowsIn("index.jsonl");
+
         assert.equal(forks, 0);
-        assert.equal(host.rowsIn("index.jsonl").length, 0);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].outcome, "precompute");
         assert.deepEqual(answer, { passedThrough: true });
     });
 

@@ -178,7 +178,11 @@ describe("a stored vector and a re-embedded one are comparable", () => {
         assert.equal(first.model, second.model);
     });
 
-    withWeights("does not let the rest of the batch change a vector", async () => {
+    // Padding a batch changes the matmul shapes, and onnxruntime's CPU kernels
+    // round differently for different shapes, so the vectors agree to about
+    // 1e-7 and never byte for byte. Anything past 1e-5 would be a real leak
+    // through the attention mask.
+    withWeights("does not let the rest of the batch change a vector beyond float noise", async () => {
         const runtime = createRuntime();
         const alone = await runtime.embed(["the monitor tick pulls the checkout"], { kind: "document" });
         const batched = await runtime.embed(
@@ -190,7 +194,10 @@ describe("a stored vector and a re-embedded one are comparable", () => {
         assert.equal(batched.ok, true);
 
         if (alone.ok && batched.ok) {
-            assert.deepEqual(batched.vectors[0], alone.vectors[0]);
+            const drift = Math.max(...batched.vectors[0].map((v, i) => Math.abs(v - alone.vectors[0][i])));
+
+            assert.equal(batched.vectors[0].length, alone.vectors[0].length);
+            assert.ok(drift < 1e-5, `batch changed a vector by ${drift}`);
         }
     });
 });

@@ -136,9 +136,9 @@ a row saying `subagent`. And a compaction compact-handoff declines for its own
 budget reasons never reaches the seam. Both are fine for now, because a
 subagent's conversation is not a memory source yet.
 
-A `precompute` compaction is passed through here without a fork. The engine is
-building a compaction it may never use, and spending on one that gets discarded
-is money for nothing. compact-handoff declines those outright, which is its
+A `precompute` compaction is passed through here without a fork, with a row
+saying so. The engine is building a compaction it may never use, and spending
+on one that gets discarded is money for nothing. compact-handoff declines those outright, which is its
 business, and this plugin hands them on because it answers no compaction ever.
 
 ## Where the data lives
@@ -480,7 +480,9 @@ refused rather than guessed.
 `truncated` is a boolean per text, reported rather than logged, because a 900-word
 memory silently losing its second half is the kind of thing that only shows up
 as bad retrieval three weeks later. The window is 512 tokens and the truncation
-is deterministic.
+is deterministic. So is a vector across processes, byte for byte; across
+batches it is not, because padding changes the kernel shapes, and the same text
+embeds to within about 1e-7 of itself. Compare vectors, never hash them.
 
 `scores` from the reranker are raw logits and are **not calibrated**. Rank with
 them; never threshold on them.
