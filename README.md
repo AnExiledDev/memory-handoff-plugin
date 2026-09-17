@@ -415,7 +415,11 @@ is what tells a refused fork from a throw.
 
 ### The bench
 
-`bench/` grades an arm against a fixture, blind. The fixture is a synthetic
+`bench/run.py` grades generation, which is this section; `bench/retrieval.py`
+grades retrieval against a labelled query set and is under Retrieval, because
+the two share a directory and nothing else.
+
+`bench/run.py` grades an arm against a fixture, blind. The fixture is a synthetic
 transcript with a checklist beside it: 22 planted facts and 7 decoys (a branch
 name, a SHA, a next-step plan, a session-state line, an obviously fake token, a
 tool-invocation line, and a roadmap item). Replies are parsed by the plugin's
@@ -742,7 +746,8 @@ made comparable at this size: BM25 is negative and unbounded, cosine is bounded,
 and a min-max normalisation over twenty candidates is degenerate the moment one
 arm returns a single row. RRF reads ranks only, so neither scale can leak into
 the other. `RRF_K = 60` is the constant from the original paper, a damping term
-rather than a tuned weight; there is no labelled corpus here to tune against.
+rather than a tuned weight; the labelled set under `bench/fixtures/retrieval` is
+what a change to it would be measured against, and nothing has been fitted to it.
 
 The merged top 30 go to `/rerank` in **one** call, and the cross-encoder's
 scores are used as a ranking and never as a threshold — they are comparable
@@ -882,14 +887,74 @@ runtime, plus four probes: a memory only the lexical arm can find, one only the
 vector arm can find, one both find, and the same strong match under the other
 project, which must never appear. It needs the weights; `bun test` does not.
 
+### What it scores
+
+`bench/retrieval.py` grades that store against a labelled query set,
+`bench/fixtures/retrieval/queries.json`: 36 queries with the titles that should
+come back, the titles that must not, and the shapes retrieval is supposed to
+handle. Six are the probe shapes (exact-token-only, paraphrase-only, both arms),
+two are superseded rows whose successor must answer instead, three are the same
+question under the other project, two are stopword-only prompts that must return
+nothing, one is a pasted log past the embedder's window, and the rest are
+ordinary "how do I / why does / what did we decide" prompts.
+
+```
+PATH=~/.bun/bin:$PATH python3 bench/retrieval.py
+PATH=~/.bun/bin:$PATH python3 bench/retrieval.py --no-runtime
+```
+
+It seeds a fresh store per run, runs every query through `search-cli.js` one at
+a time, and runs the whole set twice to check the two runs are byte-identical.
+Reports land in `bench/.runs/`, gitignored. A hybrid query that comes back
+degraded is reported as degraded and fails the run rather than being averaged
+into the hybrid numbers.
+
+**Measured 2026-09-17**, k=5, 34 scored queries of 36:
+
+| arm | hit@1 | hit@5 | MRR | leaks |
+| --- | --- | --- | --- | --- |
+| hybrid | 0.941 | 0.971 | 0.956 | 0 |
+| lexical-only (`--no-runtime`) | 0.882 | 0.971 | 0.908 | 0 |
+
+**The corpus is synthetic.** Fifty short memories written to exercise the arms,
+over two projects, queried by prompts written against those same memories. Read
+it as a floor and a regression net. The subjects do not overlap the way real
+ones do, nothing in it was written by a compaction, and no number here says what
+happens to your store.
+
+Zero leaks is the number that carries weight. Across both arms no memory from
+the other project and no superseded row reached a result list, including on the
+queries where the other project holds a copy that scores identically and only
+the filter separates them. Both stopword-only prompts returned nothing.
+
+The vector arm is worth 0.059 hit@1 here, and the two queries it moves are the
+ones it was supposed to: "what do we write down when we cannot price a call"
+goes from rank 5 to rank 1, and "how much of a long prompt does the embedder
+actually read" from 3 to 1. Neither shares a content word with the memory that
+answers it.
+
+One query misses on both arms, and it is the interesting one. The paraphrase-only
+probe ("why does the CI status go wrong when I have duplicate working trees open
+at once") shares no token with the memory that answers it, the vector arm ranks
+that memory **first** at cosine 0.678, and the cross-encoder then puts it sixth,
+behind four memories about subjects the query never mentions. Every rerank score
+on that query
+sits between -1.06 and -1.69, which is the reranker saying nothing matches; the
+order it returns in that band is noise, and RRF's correct answer is lost to it.
+Nothing is tuned in response here, on purpose. This bench is what such a change
+would be measured against.
+
 ### Not handled here
 
 - **No recency or importance weighting.** The columns exist and using them in
   the score is a change to make with a measurement behind it.
 - **No query expansion, no synonyms, no relevance feedback**, and no dedup of
   near-identical memories.
-- **No tuning.** There is no labelled corpus, and a merge weight tuned by eye on
-  ten queries is worse than a principled default.
+- **No tuning.** `RRF_K`, the arm limits and the rerank cap are the defaults
+  they shipped as. There is now a labelled query set to measure a change
+  against (see above), but it is 36 synthetic queries over 50 synthetic
+  memories, which is enough to catch a regression and not enough to fit a
+  weight to.
 
 ## Injection
 
@@ -1100,16 +1165,36 @@ arms is in, and a person's prompt is now given what it finds.
 
 What is still missing: nothing prunes or ages the store, so a memory written six
 months ago competes with one written this morning on rank alone; there is no
-recency or importance weighting in the score; nothing dedups near-identical
-memories a second compaction writes again; and no injection has been graded
-against a labelled corpus, so "the right memories were chosen" is a claim this
-repository cannot yet make.
+recency or importance weighting in the score; and nothing dedups near-identical
+memories a second compaction writes again.
+
+Retrieval is graded now: 0.941 hit@1 and zero cross-project leaks over 36
+labelled queries on a synthetic corpus, under Retrieval above. What that does
+not cover is the two halves nobody has measured yet. The corpus is fifty
+memories written for the bench rather than by a compaction, so the numbers say
+how retrieval behaves on clean, distinct subjects and not how it behaves on a
+store full of memories that overlap. And nothing grades what a prompt is
+actually given: the bench calls `search()` through the CLI, while injection
+picks its own `k`, cuts on its own budget and happens inside a live session, so
+"the right memories reached the prompt" is still a claim this repository cannot
+make. `bench/verify-injection.py` checks that the block arrives, not that it was
+worth arriving.
 
 ## Known limits
 
 - The generation prompt is graded against one synthetic fixture, twice, on one
   model. 0.966 recall and zero decoys is what that measured; it is not a claim
   about your conversations, and half of what a fork carries is chance.
+- Retrieval's 0.941 hit@1 is over a synthetic corpus of fifty memories written
+  for the bench. The one query it misses on both arms is a pure paraphrase the
+  vector arm ranks first and the cross-encoder then demotes below three
+  unrelated memories, in a score band where the reranker is saying nothing
+  matches at all.
+- A pasted log costs more rerank time than a prompt is allowed to spend. Thirty
+  pairs against a 2000-character query took 9.1 s on this box, past the 5000 ms
+  ceiling on one runtime call, so the answer comes back in merge order with
+  `rerank: unavailable`. Retrieval still answers, and the bench's long-prompt
+  query is labelled as expecting it rather than pretending otherwise.
 - A reply with no `<memories>` block is recorded and dropped. Nothing asks
   again, so a bad generation costs you that compaction's memories entirely.
 - `$.model.fork` is always null headless, the engine says so in its log, so

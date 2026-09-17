@@ -1,0 +1,374 @@
+{
+  "about": "Labelled queries over the store test/seed-retrieval.js builds. Titles, not ids: the ids move if the seed changes, the titles are what a reader can check. Every title here must exist in the seeded store; bench/retrieval.py refuses a label it cannot find, so a seed change breaks the bench loudly instead of quietly grading nothing.",
+  "seed": "test/seed-retrieval.js",
+  "projects": {
+    "a": "host/owner/alpha",
+    "b": "host/owner/beta"
+  },
+  "queries": [
+    {
+      "id": "probe-both-arms",
+      "shape": "both-arms",
+      "project": "host/owner/alpha",
+      "query": "how do I stop the worktree gate from failing on ORAT-4417",
+      "relevant": ["The worktree gate fails on ORAT-4417"],
+      "partial": ["Ticket ORAT-4417", "Parallel checkouts trip the quality barrier"],
+      "must_not": ["The cron tick is every five minutes (beta)"],
+      "note": "The seed's own probe query. The memory that shares both the tokens and the meaning should win outright; the other two probes are the same subject from one side each."
+    },
+    {
+      "id": "probe-exact-token",
+      "shape": "exact-token-only",
+      "project": "host/owner/alpha",
+      "query": "ORAT-4417",
+      "relevant": ["Ticket ORAT-4417", "The worktree gate fails on ORAT-4417"],
+      "partial": [],
+      "must_not": [],
+      "note": "A bare identifier carries no meaning for the vector arm. If this hits, the lexical arm is doing it."
+    },
+    {
+      "id": "probe-exact-token-audit",
+      "shape": "exact-token-only",
+      "project": "host/owner/alpha",
+      "query": "which board is ORAT-4417 filed under and is there anything to build in it",
+      "relevant": ["Ticket ORAT-4417"],
+      "partial": ["The worktree gate fails on ORAT-4417"],
+      "must_not": [],
+      "note": "The literal plus the paperwork side of it, so the ticket memory should outrank the gate memory that carries the same literal."
+    },
+    {
+      "id": "probe-paraphrase",
+      "shape": "paraphrase-only",
+      "project": "host/owner/alpha",
+      "query": "why does the CI status go wrong when I have duplicate working trees open at once",
+      "relevant": ["Parallel checkouts trip the quality barrier"],
+      "partial": [],
+      "must_not": [],
+      "note": "Deliberately shares no token with the memory it wants: checkouts/working trees, barrier/CI status, false red/wrong. Only the vector arm can reach it."
+    },
+    {
+      "id": "probe-paraphrase-lock",
+      "shape": "paraphrase-only",
+      "project": "host/owner/alpha",
+      "query": "two builds fighting over the same lockfile keep giving me a bogus failure",
+      "relevant": ["Parallel checkouts trip the quality barrier"],
+      "partial": [],
+      "must_not": [],
+      "note": "The same subject said the way somebody debugging it would say it. 'lock' is the one token in common, so this is the softer paraphrase case."
+    },
+    {
+      "id": "probe-both-arms-lexical",
+      "shape": "both-arms",
+      "project": "host/owner/alpha",
+      "query": "the gate fails inside a worktree on a missing submodule, what fixes it",
+      "relevant": ["The worktree gate fails on ORAT-4417"],
+      "partial": ["The submodule pointer goes second"],
+      "must_not": [],
+      "note": "The probe's subject without its identifier: both arms should still agree."
+    },
+    {
+      "id": "superseded-writes",
+      "shape": "superseded",
+      "project": "host/owner/alpha",
+      "query": "what did we decide about writing to the database outside a transaction",
+      "relevant": ["Database writes are batched (revised)"],
+      "partial": [],
+      "must_not": ["Database writes are batched"],
+      "note": "The seed supersedes the original row and keeps it. The successor answers; the row it replaced must never come back."
+    },
+    {
+      "id": "superseded-batching",
+      "shape": "superseded",
+      "project": "host/owner/alpha",
+      "query": "are writes batched per tick or per statement",
+      "relevant": ["Database writes are batched (revised)"],
+      "partial": [],
+      "must_not": ["Database writes are batched"],
+      "note": "The superseded row matches this as strongly as its successor does, which is the point: the status filter has to be what decides it, not the score."
+    },
+    {
+      "id": "cron-interval",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "how often does the cron tick run and what does a quiet one cost",
+      "relevant": ["The cron tick is every five minutes"],
+      "partial": [],
+      "must_not": ["The cron tick is every five minutes (beta)"],
+      "note": "The other project holds the same subject under its own title, which is the wrong-project case stated as a title."
+    },
+    {
+      "id": "migration-500",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "why is every page 500ing after I merged a migration when the health check is green",
+      "relevant": ["Migrations never run themselves"],
+      "partial": [],
+      "must_not": ["Migrations never run themselves (beta)"],
+      "note": ""
+    },
+    {
+      "id": "secrets-location",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "where do the secrets live and is that file committed",
+      "relevant": ["Secrets live in one env file"],
+      "partial": [],
+      "must_not": ["Secrets live in one env file (beta)"],
+      "note": ""
+    },
+    {
+      "id": "submodule-order",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "do I push the submodule commit first or bump the pointer first",
+      "relevant": ["The submodule pointer goes second"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "crash-logs",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "where does the output go when the whole thing dies before it can log properly",
+      "relevant": ["Logs rotate daily"],
+      "partial": [],
+      "must_not": [],
+      "note": "A paraphrase of the second half of that memory: the catastrophic failures go to the stderr log."
+    },
+    {
+      "id": "rerank-threshold",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "can I cut off results below a reranker score of 0.5",
+      "relevant": ["The reranker is a ranking"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "design-first",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "should I read the design note before I start on the code",
+      "relevant": ["Read the design before the code"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "announcer",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "how does a release announcement reach the channel",
+      "relevant": ["The bot is the only announcer"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "static-site",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "is the old static site still being built or is it just a redirect now",
+      "relevant": ["Static pages are retired"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "backfill-parallel",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "can I backfill several versions at the same time to get it done faster",
+      "relevant": ["Backfill is sequential"],
+      "partial": ["A sweep agent is not reproducible"],
+      "must_not": ["Backfill is sequential (beta)"],
+      "note": ""
+    },
+    {
+      "id": "weights-absent",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "does the test suite still run on a machine that never downloaded the model files",
+      "relevant": ["Weights are not in the repository"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "one-run-truth",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "can I treat one sweep run as ground truth or do I need more",
+      "relevant": ["A sweep agent is not reproducible"],
+      "partial": ["Backfill is sequential"],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "grouping-call",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "these two columns are close, do I fold them together or leave them split",
+      "relevant": ["Prefer over-grouping"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "headless-fork",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "why does a one shot headless session never exercise the replacement path",
+      "relevant": ["Headless sessions fork cold"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "daemon-port",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "what port does the daemon listen on and when does it exit",
+      "relevant": ["The port is fixed"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "cost-unknown",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "what do we write down when we cannot price a call",
+      "relevant": ["Costs are recorded, not inferred"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "tie-break",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "how are ties broken so two runs cannot swap the order",
+      "relevant": ["Determinism is a requirement"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "short-prompt-policy",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "what happens when somebody types nothing but a filler word as their whole prompt",
+      "relevant": ["Stopword prompts return nothing"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "embedder-window",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "how much of a long prompt does the embedder actually read",
+      "relevant": ["The window is 512 tokens"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "type-filter",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "if I ask for one type only, do the others still get scored",
+      "relevant": ["Type is a filter, not a score"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "supersession-kept",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "do we delete the old memory when a newer one replaces it",
+      "relevant": ["Superseded memories stay"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "vocabulary",
+      "shape": "natural",
+      "project": "host/owner/alpha",
+      "query": "is it fine for one file to call the same thing three different names",
+      "relevant": ["One vocabulary per concept"],
+      "partial": [],
+      "must_not": [],
+      "note": ""
+    },
+    {
+      "id": "stopword-only",
+      "shape": "stopword-only",
+      "project": "host/owner/alpha",
+      "query": "ok thanks",
+      "relevant": [],
+      "partial": [],
+      "must_not": [],
+      "expect_empty": true,
+      "note": "Every token is a stopword, so nothing is searchable and nothing may be injected. Graded a pass only on an empty result list."
+    },
+    {
+      "id": "stopword-only-ack",
+      "shape": "stopword-only",
+      "project": "host/owner/alpha",
+      "query": "yes please do that",
+      "relevant": [],
+      "partial": [],
+      "must_not": [],
+      "expect_empty": true,
+      "note": "The commonest real prompt there is. Five memories attached to it would be five memories attached to nothing."
+    },
+    {
+      "id": "long-paste",
+      "shape": "long-prompt",
+      "project": "host/owner/alpha",
+      "query": "how do I stop the worktree gate from failing on ORAT-4417? it has been red since this morning and I cannot see what it wants, here is the whole log:\n[gate] 09:14:02 starting quality barrier, 4 steps, 1 worker, lock /tmp/gate.lock\n[gate] 09:14:02 step 1/4 install: reading lockfile, 56 packages resolved\n[gate] 09:14:03 step 1/4 install: 56 packages installed in 812ms\n[gate] 09:14:03 step 2/4 typecheck: 214 files, project references on\n[gate] 09:14:09 step 2/4 typecheck: 0 errors in 6.1s\n[gate] 09:14:09 step 3/4 lint: 214 files, 0 warnings, cache miss\n[gate] 09:14:14 step 3/4 lint: clean in 5.4s\n[gate] 09:14:14 step 4/4 tests: discovering suites under test/\n[gate] 09:14:15 step 4/4 tests: 41 files, 388 cases, 1 worker\n[gate] 09:14:18 test/schema.test.js 26 pass 0 fail\n[gate] 09:14:20 test/parse.test.js 44 pass 0 fail\n[gate] 09:14:23 test/prompt.test.js 31 pass 0 fail\n[gate] 09:14:25 test/module.test.js 19 pass 0 fail\n[gate] 09:14:27 test/injection.test.js 22 pass 0 fail\n[gate] 09:14:31 test/retrieval-search.test.js 37 pass 0 fail\n[gate] 09:14:33 test/retrieval-merge.test.js 18 pass 0 fail\n[gate] 09:14:35 test/retrieval-query.test.js 29 pass 0 fail\n[gate] 09:14:36 test/runtime.test.js 12 pass 0 fail\n[gate] 09:14:38 test/runtime-detach.test.js 8 pass 0 fail\n[gate] 09:14:41 test/memory-admin.test.js 24 pass 0 fail\n[gate] 09:14:43 test/write-generation.test.js 16 pass 0 fail\n[gate] 09:14:44 test/generation-rows.test.js 14 pass 0 fail\n[gate] 09:14:46 test/embed-missing.test.js 11 pass 0 fail\n[gate] 09:14:47 test/retrieval-ensure-runtime.test.js 9 pass 0 fail\n[gate] 09:14:49 collecting the submodule fixtures for the integration pass\n[gate] 09:14:49 fixture root /work/.gate/fixtures does not exist\n[gate] 09:14:49 falling back to the checked out submodule at vendor/fixtures\n[gate] 09:14:49 vendor/fixtures is empty: no .git, no files, 0 entries\n[gate] 09:14:49 integration pass cannot start without the fixtures\n[gate] 09:14:49 hint: this checkout may be a secondary working copy\n[gate] 09:14:49 hint: the primary copy has the submodule, this one does not\n[gate] 09:14:49 step 4/4 tests: FAILED after 34.2s\n[gate] 09:14:49 barrier result: red (1 of 4 steps failed)\n[gate] 09:14:49 released lock /tmp/gate.lock\n[gate] 09:14:49 wrote report to .gate/last-run.json\n[gate] 09:14:49 exit 1\nI have rerun it twice and it is red both times, and a colleague on the same ticket says it is green for them on their machine.",
+      "relevant": ["The worktree gate fails on ORAT-4417"],
+      "partial": ["Parallel checkouts trip the quality barrier", "The submodule pointer goes second", "Ticket ORAT-4417"],
+      "must_not": [],
+      "expect_truncated": true,
+      "allow_degraded": true,
+      "note": "Past the embedder's window, which is the prompt a person actually sends: the question first, then the paste. The trace must record the truncation and the result must still be graded. It is allowed to come back degraded: 30 rerank pairs against 2000 characters of query take longer than the 5000 ms ceiling a prompt gives one runtime call (measured 2026-09-17: 6.2 s degraded at the default, 9.1 s and no degradation at --runtime-timeout-ms 20000), so the reranker is lost on a pasted log and the merge order is what comes back."
+    },
+    {
+      "id": "cross-project-gate",
+      "shape": "wrong-project",
+      "project": "host/owner/beta",
+      "query": "how do I stop the worktree gate from failing on ORAT-4417",
+      "relevant": ["The worktree gate fails on ORAT-4417"],
+      "partial": [],
+      "must_not": ["Ticket ORAT-4417", "Parallel checkouts trip the quality barrier"],
+      "note": "The same query under the other project. Beta holds its own copy of the strong match; alpha's two supporting probes exist nowhere else and must not cross over."
+    },
+    {
+      "id": "cross-project-cron",
+      "shape": "wrong-project",
+      "project": "host/owner/beta",
+      "query": "how often does the cron tick run and what does a quiet one cost",
+      "relevant": ["The cron tick is every five minutes (beta)"],
+      "partial": [],
+      "must_not": ["The cron tick is every five minutes"],
+      "note": "Alpha's copy scores identically on the text, so only the project filter separates them."
+    },
+    {
+      "id": "cross-project-secrets",
+      "shape": "wrong-project",
+      "project": "host/owner/beta",
+      "query": "where do the secrets live and is that file committed",
+      "relevant": ["Secrets live in one env file (beta)"],
+      "partial": [],
+      "must_not": ["Secrets live in one env file"],
+      "note": ""
+    }
+  ]
+}
