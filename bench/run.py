@@ -66,6 +66,13 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n{summary_lines(report)}\nwritten to {written}")
 
+    # A replicate the grader never scored is missing from the mean, and a mean
+    # over fewer replicates than were paid for is not the number asked for.
+    if report["ungraded"]:
+        print(f"UNGRADED: {report['ungraded']} of {args.repeat} replicate(s) have no grade; the mean above skips them")
+
+        return 1
+
     return 0
 
 
@@ -211,6 +218,7 @@ def summarise(args, fixture: Path, checklist: Checklist, replicates: list[dict])
         "grader": args.grader,
         "atoms": len(checklist.atoms),
         "recall": spread(recalls),
+        "ungraded": len(replicates) - len(recalls),
         "decoys_per_replicate": decoys,
         "memories_per_replicate": [len(row["parse"]["rows"]) if row.get("parse") else 0 for row in replicates],
         "usd": round(usd, 4),
