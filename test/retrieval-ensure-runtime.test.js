@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { ensureRuntime, READY_TIMEOUT_MS, servePath } from "../retrieval/ensure-runtime.js";
+import { AUTOSTART_COOLDOWN_MS, ensureRuntime, READY_TIMEOUT_MS, servePath } from "../retrieval/ensure-runtime.js";
 
 /**
  * A `/health` that answers from a script, so a start sequence is a list and not
@@ -33,6 +33,13 @@ const fakeClock = (pollMs) => {
     };
 };
 
+/** The stamp file as a value, so no test touches the real autostart stamp on this box. */
+const fakeStamp = (at = null) => {
+    const state = { at };
+
+    return { state, readStamp: () => state.at, writeStamp: (when) => { state.at = when; } };
+};
+
 describe("the daemon is started by retrieval, and only when it has to be", () => {
     it("spawns nothing when the runtime is already answering", async () => {
         const client = fakeClient([{ ready: true }]);
@@ -50,7 +57,7 @@ describe("the daemon is started by retrieval, and only when it has to be", () =>
         const clock = fakeClock(250);
         let spawns = 0;
 
-        const result = await ensureRuntime({ client, spawn: () => { spawns += 1; }, ...clock });
+        const result = await ensureRuntime({ client, spawn: () => { spawns += 1; }, ...clock, ...fakeStamp() });
 
         assert.deepEqual(result, { ready: true, started: true });
         assert.equal(spawns, 1, "one daemon, not one per poll");
@@ -62,7 +69,7 @@ describe("the daemon is started by retrieval, and only when it has to be", () =>
         const client = fakeClient([{ ready: false, reason: "connect failed" }, { ready: false, reason: "still loading" }]);
         const clock = fakeClock(250);
 
-        const result = await ensureRuntime({ client, spawn: () => {}, ...clock, timeoutMs: 1000, pollMs: 250 });
+        const result = await ensureRuntime({ client, spawn: () => {}, ...clock, ...fakeStamp(), timeoutMs: 1000, pollMs: 250 });
 
         assert.equal(result.ready, false);
         assert.equal(result.started, true);
@@ -89,6 +96,7 @@ describe("the daemon is started by retrieval, and only when it has to be", () =>
             client,
             spawn: () => { throw new Error("bun is not on PATH"); },
             ...fakeClock(250),
+            ...fakeStamp(),
         });
 
         assert.equal(result.ready, false);
@@ -101,5 +109,64 @@ describe("what gets started", () => {
     it("resolves serve.js from this file, not from the cwd", () => {
         assert.match(servePath(), /runtime[/\\]serve\.js$/u);
         assert.equal(READY_TIMEOUT_MS, 5000);
+    });
+});
+
+describe("a start that failed suppresses the next one", () => {
+    const down = [{ ready: false, reason: "connect failed" }];
+
+    // A wedged port -- something else listening, or a daemon dying on start --
+    // otherwise costs a fresh detached process and the whole five-second wait
+    // on every single search, forever.
+    it("spawns nothing and waits for nothing when an attempt was made a moment ago", async () => {
+        const client = fakeClient(down);
+        const stamp = fakeStamp(0);
+        const clock = fakeClock(250);
+        let spawns = 0;
+
+        const result = await ensureRuntime({ client, spawn: () => { spawns += 1; }, ...clock, ...stamp, now: () => 12_000 });
+
+        assert.equal(spawns, 0);
+        assert.equal(result.ready, false);
+        assert.equal(result.started, false);
+        assert.equal(result.reason, "runtime: autostart attempted 12s ago, not ready");
+        assert.equal(clock.now(), 0, "it did not sleep through the window either");
+    });
+
+    it("tries again once the cooldown has passed, and stamps the attempt", async () => {
+        const client = fakeClient(down);
+        const stamp = fakeStamp(0);
+        let spawns = 0;
+        const at = AUTOSTART_COOLDOWN_MS + 1;
+
+        const result = await ensureRuntime({
+            client,
+            spawn: () => { spawns += 1; },
+            sleep: async () => {},
+            now: () => at,
+            timeoutMs: 0,
+            ...stamp,
+        });
+
+        assert.equal(spawns, 1);
+        assert.equal(stamp.state.at, at, "the attempt is stamped before the wait, so a crash still counts as an attempt");
+        assert.equal(result.started, true);
+    });
+
+    it("stamps the first attempt on a box that has never started one", async () => {
+        const stamp = fakeStamp(null);
+
+        await ensureRuntime({ client: fakeClient(down), spawn: () => {}, sleep: async () => {}, now: () => 5000, timeoutMs: 0, ...stamp });
+
+        assert.equal(stamp.state.at, 5000);
+    });
+
+    it("does not stamp, or cool down, a runtime that is already up", async () => {
+        const stamp = fakeStamp(null);
+
+        const result = await ensureRuntime({ client: fakeClient([{ ready: true }]), spawn: () => {}, ...stamp });
+
+        assert.deepEqual(result, { ready: true, started: false });
+        assert.equal(stamp.state.at, null);
     });
 });

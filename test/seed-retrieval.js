@@ -111,7 +111,9 @@ const main = async () => {
     }
 
     const client = createClient({ fetchText: bunFetchText });
-    const runtime = await ensureRuntime({ client });
+    // Seeding is not a prompt: it can afford to start the daemon even if a
+    // search a moment ago failed to, so the autostart cooldown is off here.
+    const runtime = await ensureRuntime({ client, cooldownMs: 0 });
 
     if (!runtime.ready) {
         fail(`the runtime is not ready: ${runtime.reason}. The seed needs real embeddings; retrieval itself degrades without them, this does not.`);

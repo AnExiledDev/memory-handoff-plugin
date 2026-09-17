@@ -10,18 +10,41 @@
  *
  * The bound is the point. A retrieval runs while a user waits for a prompt to
  * go out, so this waits a few seconds for the weights to come up and then gives
- * up and lets retrieval degrade to FTS5-only. **It never blocks the prompt**,
- * and it is never the thing that turns a slow model load into a hung session.
+ * up and lets retrieval degrade to FTS5-only.
+ *
+ * **This bounds the start and nothing else.** `/health` answers `ready: true`
+ * while the ONNX sessions are still loading — it checks that a load was begun,
+ * not that it finished — so a daemon can pass this and then sit on an `/embed`
+ * for as long as the load takes. The call timeouts in `search.js` are the other
+ * half of the bound, and the honest guarantee is the sum of the three: this
+ * window, plus the embed timeout, plus the rerank timeout.
  */
 
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { defaultDbPath } from "../schema/bun-sqlite.js";
 
 /** How long a start is given before retrieval goes on without it. */
 export const READY_TIMEOUT_MS = 5000;
 
 /** How often `/health` is asked during that window. */
 export const POLL_MS = 250;
+
+/**
+ * How long a failed start suppresses the next one.
+ *
+ * Without it, a port 8794 that is wedged — something else listening, or a
+ * daemon that came up without weights — costs a fresh detached process **and**
+ * the full wait on every single retrieval, forever. One attempt a minute is
+ * enough to recover from a daemon that died and cheap enough that a permanently
+ * broken port costs a stat() per search.
+ */
+export const AUTOSTART_COOLDOWN_MS = 60_000;
+
+/** Where the attempt is stamped when a caller does not say. Beside the database, which is where this plugin's state lives. */
+export const defaultStampPath = () => `${defaultDbPath()}.autostart`;
 
 /** `bun runtime/serve.js`, resolved from this file so the cwd cannot change what gets started. */
 export const servePath = () => join(dirname(fileURLToPath(import.meta.url)), "..", "runtime", "serve.js");
@@ -34,9 +57,9 @@ export const servePath = () => join(dirname(fileURLToPath(import.meta.url)), "..
  */
 
 /**
- * Health, then a start, then a bounded wait.
+ * Health, then the cooldown, then a start, then a bounded wait.
  *
- * @param {{ client: { health: () => Promise<{ ready: boolean, reason?: string }> }, spawn?: () => void, sleep?: (ms: number) => Promise<void>, now?: () => number, timeoutMs?: number, pollMs?: number }} options
+ * @param {{ client: { health: () => Promise<{ ready: boolean, reason?: string }> }, spawn?: () => void, sleep?: (ms: number) => Promise<void>, now?: () => number, timeoutMs?: number, pollMs?: number, cooldownMs?: number, stampPath?: string, readStamp?: () => number | null, writeStamp?: (at: number) => void }} options
  * @returns {Promise<EnsureResult>}
  */
 export const ensureRuntime = async (options) => {
@@ -57,6 +80,21 @@ export const ensureRuntime = async (options) => {
     const now = options.now ?? (() => Date.now());
     const timeoutMs = options.timeoutMs ?? READY_TIMEOUT_MS;
     const pollMs = options.pollMs ?? POLL_MS;
+    const cooldownMs = options.cooldownMs ?? AUTOSTART_COOLDOWN_MS;
+    const readStamp = options.readStamp ?? (() => readStampFile(options.stampPath ?? defaultStampPath()));
+    const writeStamp = options.writeStamp ?? ((at) => writeStampFile(options.stampPath ?? defaultStampPath(), at));
+    const attemptedAt = readStamp();
+
+    // A recent attempt that did not produce a working daemon means the port is
+    // wedged or the daemon is dying on start. Spawning again and waiting again
+    // costs the caller the whole window for the same answer.
+    if (attemptedAt !== null && now() - attemptedAt < cooldownMs) {
+        const ago = Math.round((now() - attemptedAt) / 1000);
+
+        return { ready: false, started: false, reason: `runtime: autostart attempted ${ago}s ago, not ready` };
+    }
+
+    writeStamp(now());
 
     try {
         spawn();
@@ -100,6 +138,35 @@ export const spawnDaemon = () => {
     });
 
     child.unref();
+};
+
+/**
+ * The cooldown stamp, read and written fail-soft.
+ *
+ * A stamp that cannot be read is no cooldown and a stamp that cannot be written
+ * is a cooldown that does not happen: both are worse than the alternative, and
+ * neither is worth failing a retrieval over.
+ *
+ * @param {string} path
+ * @returns {number | null}
+ */
+const readStampFile = (path) => {
+    try {
+        const at = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+
+        return Number.isFinite(at) ? at : null;
+    } catch {
+        return null;
+    }
+};
+
+/** @param {string} path @param {number} at @returns {void} */
+const writeStampFile = (path, at) => {
+    try {
+        writeFileSync(path, `${at}\n`);
+    } catch {
+        // See readStampFile: a cooldown we cannot record is not an error.
+    }
 };
 
 /** @param {unknown} error @returns {string} */
