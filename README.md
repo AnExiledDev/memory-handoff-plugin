@@ -95,9 +95,48 @@ git clone https://github.com/AnExiledDev/memory-handoff-plugin.git
 CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 MEMORY_HANDOFF_LIVE=1 claude --plugin-dir ./memory-handoff-plugin
 ```
 
-The runtime is Bun, and the tests run under `bun test`. The operator's
-instruction on 2026-09-16, verbatim: *"For runtime use bun unless there is a
-genuinly faster smaller option."*
+The runtime is Bun. The operator's instruction on 2026-09-16, verbatim: *"For
+runtime use bun unless there is a genuinly faster smaller option."*
+
+There are two suites, two runners, and both have to pass:
+
+```bash
+bun install             # once; the embedder's weights are a dependency
+bun test                # this plugin's own code, against a stub $
+claude plugin test .    # this plugin loaded into a real engine
+```
+
+`bunfig.toml` pins `[test] root = "test"`, which is load-bearing rather than
+tidy: bun's positional argument is a substring filter and not a directory, so
+`bun test test/` still matches `engine-test/` and the run dies on an import only
+the Claude Code binary can resolve. Without `bun install` twelve of the runtime
+tests fail on `dependencies missing (@huggingface/transformers)`, which is the
+environment talking and not the code.
+
+`claude plugin test` runs every `*.test.ts` under the plugin root, each file in a
+child of the binary. It buys the one thing a stub `$` cannot: seam detection
+decided by the engine. `engine-test/seam.test.ts` loads a stand-in
+compact-handoff as an inline plugin, folding the same noun onto `$` at
+`engine.create` with a version no real release carries, and reads the result back
+out of `memory_status`; the second test loads nothing, so the absent case is
+genuinely absent rather than a stub pretending. Breaking the recording (writing
+`null` instead of the reading) turns both red.
+
+Three shapes in that file are forced by the engine rather than chosen, and the
+first two cost a run each to find:
+
+- **An inline plugin's `register` closes over nothing,** not even a `const` at
+  the top of the same file. A name from the test file's scope fails the load with
+  `PROBE_TOOL is not defined`.
+- **A hook registered in the test body is never scanned,** so every call it makes
+  on another plugin's noun is refused with `its hooks module does not call it`.
+  Only a `register` is scanned.
+- **Nothing sits beneath the plugins in a test,** so each engine call this plugin
+  makes has to be answered by the test or its whole hook is skipped with `no
+  implementation for <event>`. The `bottom` helper is that list, and it is worth
+  reading as an exact record of what the seam path asks the engine for. The
+  result shapes are not uniform: `tool.register` wants `{ value }` and
+  `session.start` wants `{ cwd }`.
 
 ## Working beside compact-handoff
 
@@ -115,6 +154,15 @@ does not depend on the order.
 **Alone**, memory-handoff hooks `session.compact` itself, takes one fork over
 the pre-compaction transcript, writes its row, and returns `next(e)` so the
 engine compacts exactly as it always did. The row records `via: "hook"`.
+
+**The seam is typed.** Since compact-handoff 0.8.0 its manifest names a type
+contract, so `/plugin-types` writes
+`.claude/types/claude-code-plugins/compact-handoff.d.ts` into this checkout and
+references it from the index beside it. `jsconfig.json` here includes
+`.claude/types`, which is why `$.compactHandoff.beforeCompact({ tool })` is
+typed with nothing copied into this repo and nothing to keep in step by hand.
+The folder is generated per project and is gitignored; regenerate it with
+`/plugin-types` rather than editing it.
 
 **Together**, compact-handoff exposes a seam, and the seam carries strings.
 At `session.start` this plugin hands it the name of a tool:
@@ -1142,6 +1190,42 @@ would give you a pane with nothing in it, taking a third of the terminal to say
 so. **Close it and it stays closed** for the rest of the session; the plugin
 remembers a close whose origin is the person and never reopens. It is redrawn
 after each injection.
+
+**Press a memory row and it opens in place.** Since 0.7.0 each row is a
+`Button` rather than a line of text: Enter on the focused row, or a click, draws
+that memory's own text beneath it as the markdown it is, in a `Markdown`
+element with the surface's own renderer. Press it again and it closes; pressing
+another row moves the open one. The focus ring starts on the first row
+(`autoFocus`), so Enter acts on something the moment the pane takes the
+keyboard, and opening a row calls `$.ui.scroll` with `block: "nearest"` — a row
+already whole in the window does not move, so pressing down a list does not
+yank it.
+
+This is the answer to the question the pane always raised and could not answer:
+*what did it actually put in my prompt?* Before, the row named a memory and the
+text was a `memory_explain` call away, which costs a turn. Now it is one
+keypress and no model call at all.
+
+Three details that are deliberate rather than incidental:
+
+- **The text comes from this session's own composed block**, bounded to 8,000
+  characters per memory when the row is recorded. Nothing reads the database
+  inside a render hook.
+- **`Markdown` takes at most 10,000 characters and is refused over it**, and a
+  refused element takes the whole drawing with it, so the text is trimmed to the
+  ceiling before it is handed over. Everything else the pane draws is still cut
+  to the body width, because the pane scrolls vertically and `Code`'s wrap
+  overdraw at 2.1.269 is what a wrapped line looks like in the wrong element.
+- **A surface without `Button` or `Markdown` still gets a pane.** The rows fall
+  back to the `Text` lines they were and an open memory draws as width-cut
+  lines, so nothing here is load-bearing on a surface that cannot press.
+
+Verified on engine 2.1.274 (2026-09-17): `bench/verify-injection.py run compact
+pane` drew the row on a real terminal as `> 1. [1] Staging database and deploy
+webhook  rerank 2.3386`, a `plain` Button at rest. **What the bench does not
+press:** it reads the screen and quits, so the press itself is covered by the
+tree tests and by one end-to-end press through the real module in
+`test/injection.test.js`, not by a keystroke in a real session.
 
 ### Verified live
 

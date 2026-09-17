@@ -155,6 +155,14 @@ const PANE_TITLE = "Memories";
 const MAX_PANE_INJECTIONS = 20;
 
 /**
+ * How much of a memory's text the pane keeps, per memory.
+ *
+ * Under `Markdown`'s 10,000 character ceiling with room to spare, and twenty
+ * injections of it is the ceiling on what this costs the process.
+ */
+const PANE_BODY_CHARS = 8000;
+
+/**
  * Everything that belongs to this session and nothing else.
  *
  * `$.store` is the plugin's one JSON file under the configuration directory,
@@ -174,6 +182,8 @@ const freshSession = () => ({
     counts: {},
     /** Whether the pane was opened, and whether the person closed it. */
     pane: { opened: false, closedByPerson: false },
+    /** The memory row the pane has open, by `rowKey`; `null` when none is. */
+    openRow: null,
     /** The project key, worked out once from git. `null` until it is. */
     project: null,
 });
@@ -821,11 +831,25 @@ const rehearsedPlan = (plan) => ({
     dropped: plan.candidates,
 });
 
-/** What the pane and the row keep about one chosen memory. */
+/**
+ * What the pane and the row keep about one chosen memory.
+ *
+ * The body rides along so a press on the row can draw what actually went into
+ * the prompt without a database call inside a render hook. It is the text this
+ * session already composed into the block, bounded here rather than at the
+ * element: over `Markdown`'s own ceiling the element is refused, and a refused
+ * element takes the whole pane with it.
+ */
 const paneEntry = (entry) => {
     const scored = finalScoreOf(entry);
 
-    return { memoryId: entry.memoryId, title: entry.title, score: scored.score, scoreKind: scored.kind };
+    return {
+        memoryId: entry.memoryId,
+        title: entry.title,
+        score: scored.score,
+        scoreKind: scored.kind,
+        body: typeof entry.body === "string" ? entry.body.slice(0, PANE_BODY_CHARS) : "",
+    };
 };
 
 /**
@@ -972,16 +996,52 @@ const showPane = async ($) => {
     await safely($, () => $.ui.invalidate("ui.render"));
 };
 
-/** This session's injections, drawn. The tree itself is `hooks/pane.js`. */
+/**
+ * This session's injections, drawn. The tree itself is `hooks/pane.js`.
+ *
+ * `actions` is how a press reaches this module: `paneTree` gets a closure, never
+ * `$`. The engine's static scan refuses a hooks module that hands `$` to
+ * anything but a top-level function of its own file, and `paneTree` is
+ * imported.
+ */
 const drawMemoryPane = async ($, e) => {
     const elements = $.ui.resolve(e);
     const view = {
         live: await isLive($),
         dbPath: await dbFile($),
         injections: session.injections,
+        openKey: session.openRow,
     };
 
-    return paneTree(elements, view, e.props?.bodyColumns ?? e.viewport?.columns);
+    return paneTree(elements, view, e.props?.bodyColumns ?? e.viewport?.columns, {
+        toggle: (key) => {
+            toggleRow($, key);
+        },
+    });
+};
+
+/**
+ * Opens the memory the person pressed, or closes it when it was already open.
+ *
+ * `onPress` is declared `() => void` and the surface does not wait on it, so
+ * this is deliberately not awaited by its caller: the redraw and the scroll
+ * settle on their own, and a failure in either is logged rather than thrown
+ * into a press the surface has already finished with.
+ */
+const toggleRow = ($, key) => {
+    const opening = session.openRow !== key;
+
+    session.openRow = opening ? key : null;
+
+    void (async () => {
+        await safely($, () => $.ui.invalidate("ui.render"));
+
+        // Only on the way open, and only `nearest`: a row already whole in the
+        // window does not move, so pressing down a list does not yank it.
+        if (opening) {
+            await safely($, () => $.ui.scroll({ in: PANE_ID, to: { key }, block: "nearest" }));
+        }
+    })();
 };
 
 /* ------------------------------------------------------------------- tools */
