@@ -1220,6 +1220,13 @@ Three details that are deliberate rather than incidental:
   back to the `Text` lines they were and an open memory draws as width-cut
   lines, so nothing here is load-bearing on a surface that cannot press.
 
+Verified on engine 2.1.274 (2026-09-17): `bench/verify-injection.py run compact
+pane` drew the row on a real terminal as `> 1. [1] Staging database and deploy
+webhook  rerank 2.3386`, a `plain` Button at rest. **What the bench does not
+press:** it reads the screen and quits, so the press itself is covered by the
+tree tests and by one end-to-end press through the real module in
+`test/injection.test.js`, not by a keystroke in a real session.
+
 ### Verified live
 
 `bench/verify-injection.py` drives real Claude Code sessions through all of
