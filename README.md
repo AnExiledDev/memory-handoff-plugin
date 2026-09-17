@@ -309,9 +309,8 @@ tables, no `RETURNING` and no `->>` operator; it runs on the 3.53.0 inside
 ## Generation
 
 The prompt the fork is asked is `GENERATION_PROMPT` in `hooks/prompt.js`, and
-the same text is `bench/prompts/v3.txt`. The numbers below were measured on
-`v2.txt`; v3 adds one write-list bullet and has not been re-graded (see the
-table's note). A test asserts the constant and the file are byte for byte equal,
+the same text is `bench/prompts/v3.txt`, which is the arm that ships and the
+last row of the table below. A test asserts the constant and the file are byte for byte equal,
 because a bench that grades a file while the hook forks a constant measures
 nothing.
 
@@ -446,7 +445,8 @@ grading `claude-sonnet-5`, 22 atoms:
 | arm | recall mean | min | max | spread | decoys per replicate | memories | cost |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | v1 | 0.898 | 0.886 | 0.909 | 0.023 | 1, 1 | 23, 23 | $0.4894 |
-| **v2** | **0.966** | 0.932 | 1.000 | 0.068 | **0, 0** | 22, 22 | $0.4773 |
+| v2 | 0.966 | 0.932 | 1.000 | 0.068 | 0, 0 | 22, 22 | $0.4773 |
+| **v3** | **0.943** | 0.909 | 0.977 | 0.068 | **0, 0** | 22, 22 | $0.5589 |
 
 v1 leaked the same decoy on both replicates: the fixture's "Kafka next quarter"
 roadmap item, written down as a constraint on how much to build now. The whole
@@ -454,14 +454,17 @@ difference in v2 is two sentences in the never-write paragraph, naming a plan
 for a future quarter outright and saying that a roadmap arriving as a reason to
 do less work is still a roadmap. v2 ships.
 
-**v3 ships, unmeasured on this bench.** It is v2 plus one write-list bullet:
-anything the person explicitly asked to have remembered is written, and that
-one case is carved out of the never-write list's precedence. The change came
-from the live verifier (`bench/verify-injection.py`, 2026-09-17), where a fork
-under v2 answered an empty block to a session whose only content was two facts
-the person had asked it to remember; both read as session state. The ledgerctl
-fixture plants no explicit request, so this bench cannot see the difference,
-and the verifier's `compact` and `inject` checks are the measurement for it.
+**v3 ships.** It is v2 plus one write-list bullet: anything the person
+explicitly asked to have remembered is written, and that one case is carved
+out of the never-write list's precedence. The change came from the live
+verifier (`bench/verify-injection.py`, 2026-09-17), where a fork under v2
+answered an empty block to a session whose only content was two facts the
+person had asked it to remember; both read as session state. The ledgerctl
+fixture plants no explicit request, so this bench cannot see the gain; what it
+shows is that the bullet cost nothing the bench can see: zero decoys on both
+replicates, and a recall mean inside v2's own spread (the one `wrong` verdict
+was the same grader pedantry as v1's). The verifier's `compact` and `inject`
+checks are the measurement for the change itself.
 
 Read the numbers as a floor rather than a score. Two replicates cannot separate
 0.966 from 0.93, the recall spread is wider than the gap between the arms on
