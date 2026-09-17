@@ -945,7 +945,7 @@ in the database, before you let it reach a model.
 | --- | --- | --- |
 | `memory_search` | `query`, `k?`, `types?` | This project's matching memories with their scores and the retrieval id that explains the ranking. |
 | `memory_explain` | `retrievalId` | Why one retrieval ranked what it did: its filters, every candidate, and each stage's score. |
-| `memory_status` | none | Whether the plugin is live, where its database is, whether it is reading compactions through the seam or its own hook, what this session has written, retrieved, injected and spent, and what the whole store holds. |
+| `memory_status` | none | Whether the plugin is live, where its database is, whether it is reading compactions through the seam or its own hook, what this session has written, retrieved, injected and spent, and what the whole store holds, including `database.unembedded`: active memories still without a vector, which is the number that says the vector arm is not seeing them. |
 | `memory_list` | `limit?`, `offset?`, `status?` | This project's memories newest first, whether or not they match anything. |
 | `memory_delete` | `id`, `purge?` | Removes a memory. Tombstoned by default; `purge: true` deletes the row. |
 

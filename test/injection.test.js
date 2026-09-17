@@ -424,6 +424,23 @@ describe("the pane", () => {
         assert.deepEqual(host.invalidations, ["ui.render", "ui.render"]);
     });
 
+    it("opens again in the next session, whatever the last one left in the store", async () => {
+        const host = fakeApi();
+        const first = await started(host);
+
+        await first.dispatch("prompt.submit", host.$, promptInput(), passThrough());
+        await first.dispatch("ui.close", host.$, { id: "memory-handoff", origin: { kind: "person" } }, passThrough());
+
+        // The same store, because `$.store` is one file the plugin keeps
+        // between sessions; a session's pane state must not be in it.
+        const second = await started(host);
+
+        await second.dispatch("prompt.submit", host.$, promptInput(), passThrough());
+
+        assert.equal(host.opens.length, 2, "the second session opens its own pane");
+        assert.equal(host.adminDocs("injection").length, 2);
+    });
+
     it("stays closed once the person closes it", async () => {
         const host = fakeApi();
         const runtime = await started(host);

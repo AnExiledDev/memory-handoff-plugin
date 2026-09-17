@@ -133,6 +133,13 @@ const counts = (db) => {
         ok: true,
         memories: { total: memories.total ?? 0, active: memories.active ?? 0, deleted: memories.deleted ?? 0 },
         projects: one("SELECT count(DISTINCT project) AS n FROM memories").n ?? 0,
+        // Active memories with no vector are found by FTS5 alone until the
+        // embedder behind the writer has run; a store where this stays above
+        // zero has a runtime that never comes up.
+        unembedded: one(
+            `SELECT count(*) AS n FROM memories m
+              WHERE m.status = 'active' AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.memory_id = m.id)`,
+        ).n ?? 0,
         generations: one("SELECT count(*) AS n FROM generations").n ?? 0,
         retrievals: one("SELECT count(*) AS n FROM retrievals").n ?? 0,
         injections: one("SELECT count(*) AS n FROM injections").n ?? 0,

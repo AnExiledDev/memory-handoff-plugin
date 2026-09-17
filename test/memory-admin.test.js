@@ -105,6 +105,7 @@ describe("memory-admin counts", () => {
             assert.equal(answer.ok, true);
             assert.deepEqual(answer.memories, { total: 2, active: 2, deleted: 0 });
             assert.equal(answer.projects, 1);
+            assert.equal(answer.unembedded, 2, "both memories have no vector until the embedder has run");
             assert.equal(answer.generations, 1);
             assert.equal(answer.injections, 0);
 

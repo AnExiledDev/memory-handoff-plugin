@@ -147,17 +147,31 @@ const PANE_TITLE = "Memories";
 /** How many prompts the pane lists before the oldest falls off. */
 const MAX_PANE_INJECTIONS = 20;
 
-/** What this session has injected, for the pane. Newest first. */
-const INJECTIONS_KEY = "injections";
+/**
+ * Everything that belongs to this session and nothing else.
+ *
+ * `$.store` is the plugin's one JSON file under the configuration directory,
+ * kept between sessions and shared by every session running at once, so
+ * anything "for this session" written there is read back by the next session
+ * and the one beside it: the pane opened once and never again, the budget
+ * summed across a week, another directory's project key. Measured live on
+ * 2026-09-17 (the pane never appeared after the first session). Process memory
+ * is per session by construction; it is reset on `session.start` for the hot
+ * reload that keeps the process, and the store keeps only the seam reading,
+ * which is the one fact worth keeping across sessions.
+ */
+const freshSession = () => ({
+    /** What this session has injected, for the pane. Newest first. */
+    injections: [],
+    /** This session's running counts, for `memory_status` and the budget. */
+    counts: {},
+    /** Whether the pane was opened, and whether the person closed it. */
+    pane: { opened: false, closedByPerson: false },
+    /** The project key, worked out once from git. `null` until it is. */
+    project: null,
+});
 
-/** This session's running counts, for `memory_status` and the budget. */
-const SESSION_KEY = "session";
-
-/** Whether the pane was opened, and whether the person closed it. */
-const PANE_KEY = "pane";
-
-/** The project key, worked out once per session from git. */
-const PROJECT_KEY = "project";
+let session = freshSession();
 
 /** The counters a session starts with. */
 const EMPTY_SESSION = {
@@ -189,6 +203,8 @@ const THREW = { ok: false, reason: "memory-handoff: the call threw, and the reas
  */
 export const register = (on) => {
     on("session.start", async ($, e, next) => {
+        session = freshSession();
+
         await safely($, () => registerTools($));
         await safely($, () => subscribeToSeam($));
 
@@ -236,7 +252,7 @@ export const register = (on) => {
      */
     on("ui.close", async ($, e, next) => {
         if (e.id === PANE_ID && e.origin?.kind === "person") {
-            await safely($, () => $.store.set(PANE_KEY, { opened: false, closedByPerson: true }));
+            session.pane = { opened: false, closedByPerson: true };
         }
 
         return next(e);
@@ -879,7 +895,6 @@ const recordInjection = async ($, plan) => {
 
 /** The pane's list: newest first, and short, because it is a view and not the log. */
 const rememberInjection = async ($, plan) => {
-    const seen = (await safely($, () => $.store.get(INJECTIONS_KEY))) ?? [];
     const entry = {
         at: new Date().toISOString(),
         prompt: promptLine(plan.query),
@@ -892,7 +907,7 @@ const rememberInjection = async ($, plan) => {
         reason: plan.reason,
     };
 
-    await safely($, () => $.store.set(INJECTIONS_KEY, [entry, ...(Array.isArray(seen) ? seen : [])].slice(0, MAX_PANE_INJECTIONS)));
+    session.injections = [entry, ...session.injections].slice(0, MAX_PANE_INJECTIONS);
 };
 
 /**
@@ -907,16 +922,14 @@ const rememberInjection = async ($, plan) => {
  * because "the pane never appeared" is otherwise unanswerable.
  */
 const showPane = async ($) => {
-    const state = (await safely($, () => $.store.get(PANE_KEY))) ?? { opened: false, closedByPerson: false };
-
-    if (state.closedByPerson === true) {
+    if (session.pane.closedByPerson === true) {
         return;
     }
 
-    if (state.opened !== true) {
+    if (session.pane.opened !== true) {
         try {
             await $.ui.open({ id: PANE_ID, title: PANE_TITLE });
-            await safely($, () => $.store.set(PANE_KEY, { opened: true, closedByPerson: false }));
+            session.pane = { opened: true, closedByPerson: false };
         } catch (error) {
             await safely($, () => $.ui.log(`memory-handoff: the pane would not open: ${String(error).slice(0, 200)}`));
 
@@ -933,7 +946,7 @@ const drawMemoryPane = async ($, e) => {
     const view = {
         live: await isLive($),
         dbPath: await dbFile($),
-        injections: (await safely($, () => $.store.get(INJECTIONS_KEY))) ?? [],
+        injections: session.injections,
     };
 
     return paneTree(elements, view, e.props?.bodyColumns ?? e.viewport?.columns);
@@ -1045,27 +1058,20 @@ const adminCall = async ($, op, doc) => {
  * retrieval that silently returns nothing.
  */
 const projectFor = async ($) => {
-    const cached = await safely($, () => $.store.get(PROJECT_KEY));
-
-    if (cached !== null && cached !== undefined) {
-        return cached.project;
+    if (session.project !== null) {
+        return session.project.project;
     }
 
     const cwd = await safely($, () => $.session.cwd());
     const where = await gitFacts($, cwd);
-    const keyed = projectKey(where.remoteUrl, where.toplevel, cwd);
 
-    await safely($, () => $.store.set(PROJECT_KEY, keyed));
+    session.project = projectKey(where.remoteUrl, where.toplevel, cwd);
 
-    return keyed.project;
+    return session.project.project;
 };
 
-/** This session's running counts, whatever the store holds. */
-const sessionCounts = async ($) => {
-    const seen = await safely($, () => $.store.get(SESSION_KEY));
-
-    return { ...EMPTY_SESSION, ...(seen ?? {}) };
-};
+/** This session's running counts. */
+const sessionCounts = async () => ({ ...EMPTY_SESSION, ...session.counts });
 
 /** Adds to this session's counts. Every field is a total, so every write is a sum. */
 const bumpSession = async ($, patch) => {
@@ -1075,7 +1081,7 @@ const bumpSession = async ($, patch) => {
         after[key] = (after[key] ?? 0) + (Number.isFinite(value) ? value : 0);
     }
 
-    await safely($, () => $.store.set(SESSION_KEY, after));
+    session.counts = after;
 
     return after;
 };
