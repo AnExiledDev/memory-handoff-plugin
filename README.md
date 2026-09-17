@@ -972,6 +972,40 @@ so. **Close it and it stays closed** for the rest of the session; the plugin
 remembers a close whose origin is the person and never reopens. It is redrawn
 after each injection.
 
+### Verified live
+
+`bench/verify-injection.py` drives real Claude Code sessions through all of
+this in a pty, against an isolated config dir, data dir and throwaway git
+repository, and reads its verdicts off the rows the plugin wrote rather than off
+the screen. Six checks: `compact` (a compaction becomes memories through
+compact-handoff's seam, and they get vectors), `inject` (a later session is
+handed them and answers from them, with every built-in tool and the memory tools
+taken away so it cannot look them up itself), `pane`, `rehearse`
+(`MEMORY_HANDOFF_LIVE` off: the row is written and nothing reaches the model),
+`tool` and `headless`. It needs
+`pexpect`, a logged-in Claude Code, and compact-handoff beside this plugin or
+`COMPACT_HANDOFF_PLUGIN`; it costs a few cents of model time per run.
+
+```sh
+python3 bench/verify-injection.py setup
+python3 bench/verify-injection.py run all
+python3 bench/verify-injection.py table
+```
+
+Two things it caught that no unit test could: the autostarted runtime dying
+with the session's pty, and every "this session" value living in `$.store`,
+which is one file kept between sessions, so the pane opened in the first
+session and never again. Both are fixed at the root and documented where the
+code is. Claude Code's own auto-memory is off in the sessions it drives, because
+it wrote the planted fact into the config dir and loaded it into every later
+session, which read exactly like an injection. The answering sessions run with
+`--tools ""` because a haiku session, asked the planted question with Bash and
+Grep still available, went and found the fact in an old transcript on disk. And
+`compact` mints a fresh pair of facts every run: the store hands the last pair
+back on the facts prompt itself, and a fork asked to extract what the session
+was already given correctly writes nothing (three empty generations, haiku and
+sonnet, before that was understood).
+
 ### Headless
 
 `$.model.fork` is always null headless, so nothing is generated under
