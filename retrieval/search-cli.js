@@ -4,7 +4,8 @@
  *
  *     bun retrieval/search-cli.js <db> --project P --query "..." [--k 5]
  *         [--types user,project] [--status active] [--since ISO] [--until ISO]
- *         [--origin manual|prompt|tool] [--runtime-timeout-ms N] [--no-runtime] [--with-id]
+ *         [--origin manual|prompt|tool] [--session-id ID] [--turn-id ID]
+ *         [--runtime-timeout-ms N] [--no-runtime] [--with-id]
  *
  * No Claude Code session, no hook, no plugin: this is the same `search()` the
  * prompt hook will call in #684, with a database path instead of a session.
@@ -25,7 +26,7 @@ import { createClient } from "../runtime/client.js";
 import { ensureRuntime } from "./ensure-runtime.js";
 import { RUNTIME_TIMEOUT_MS, search } from "./search.js";
 
-const USAGE = "usage: bun retrieval/search-cli.js <db> --project P --query \"...\" [--k N] [--types a,b] [--status a,b] [--since ISO] [--until ISO] [--origin manual|prompt|tool] [--runtime-timeout-ms N] [--no-runtime] [--with-id]";
+const USAGE = "usage: bun retrieval/search-cli.js <db> --project P --query \"...\" [--k N] [--types a,b] [--status a,b] [--since ISO] [--until ISO] [--origin manual|prompt|tool] [--session-id ID] [--turn-id ID] [--runtime-timeout-ms N] [--no-runtime] [--with-id]";
 
 /**
  * `fetch` with the same ceiling `search()` races its calls against, so a
@@ -75,6 +76,11 @@ const main = async () => {
                 until: flags.until ?? null,
                 k: flags.k === undefined ? undefined : Number.parseInt(flags.k, 10),
                 origin: /** @type {any} */ (flags.origin ?? "manual"),
+                // Stamped on the `retrievals` row so a trace can be read back
+                // beside the session and the turn it was run for; the prompt
+                // hook has both and nothing else could supply them later.
+                sessionId: idOf(flags["session-id"]),
+                turnId: idOf(flags["turn-id"]),
                 runtimeTimeoutMs: timeoutMs,
             },
             {
@@ -129,6 +135,9 @@ const parseFlags = (argv) => {
 
     return flags;
 };
+
+/** A flag given without a value is `true`, and `true` is not an id. */
+const idOf = (raw) => (typeof raw === "string" && raw.trim() !== "" ? raw.trim() : null);
 
 const listOf = (raw) =>
     typeof raw === "string" ? raw.split(",").map((part) => part.trim()).filter((part) => part !== "") : undefined;
