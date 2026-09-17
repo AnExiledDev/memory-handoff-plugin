@@ -95,7 +95,7 @@ export const unit = (vector) => {
 /**
  * The runtime, as a value the test chooses.
  *
- * @param {{ queryVector?: number[], rerank?: (query: string, docs: string[]) => number[], embedFails?: string, rerankFails?: string, ready?: boolean }} options
+ * @param {{ queryVector?: number[], rerank?: (query: string, docs: string[]) => number[], embedFails?: string, rerankFails?: string, ready?: boolean, embedModel?: string, embedHangs?: boolean, rerankHangs?: boolean }} options
  */
 export const fakeClient = (options = {}) => {
     const calls = { embed: [], rerank: [] };
@@ -106,6 +106,12 @@ export const fakeClient = (options = {}) => {
         embed: async (texts, init = {}) => {
             calls.embed.push({ texts, kind: init.kind });
 
+            // A runtime whose /health said ready while its ONNX sessions were
+            // still loading. The call is not refused; it simply never answers.
+            if (options.embedHangs === true) {
+                return forever();
+            }
+
             if (options.embedFails !== undefined) {
                 return { ok: false, reason: options.embedFails };
             }
@@ -114,13 +120,17 @@ export const fakeClient = (options = {}) => {
                 ok: true,
                 vectors: texts.map(() => unit(options.queryVector ?? [1, 0, 0, 0])),
                 dim: (options.queryVector ?? [1, 0, 0, 0]).length,
-                model: FAKE_EMBED_MODEL,
+                model: options.embedModel ?? FAKE_EMBED_MODEL,
                 ms: 1,
                 truncated: texts.map(() => false),
             };
         },
         rerank: async (query, docs) => {
             calls.rerank.push({ query, docs });
+
+            if (options.rerankHangs === true) {
+                return forever();
+            }
 
             if (options.rerankFails !== undefined) {
                 return { ok: false, reason: options.rerankFails };
@@ -136,3 +146,6 @@ export const fakeClient = (options = {}) => {
         },
     };
 };
+
+/** A call that never answers, which is the failure a timeout exists for. */
+const forever = () => new Promise(() => {});

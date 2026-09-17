@@ -19,6 +19,14 @@
  * zero results with the reason on the trace. A caller can always tell the
  * difference between "nothing matched" and "half the pipeline was missing".
  *
+ * **It is bounded.** A daemon's `/health` says `ready: true` as soon as a load
+ * has *begun*, so a runtime that answered can still block on the first `/embed`
+ * for as long as its ONNX sessions take to load. Every call out of here is
+ * raced against `runtimeTimeoutMs`, and a call that overruns is a degraded rung
+ * with its reason on the trace, exactly like a runtime that was never there.
+ * The worst case is the autostart window plus the embed timeout plus the rerank
+ * timeout — not "never blocks", which was never true.
+ *
  * **Every retrieval is explainable from the database alone.** One `retrievals`
  * row, one `retrieval_candidates` row per candidate considered including the
  * ones it threw away, and the reason on each. `explain.js` reads them back and
@@ -27,7 +35,7 @@
 
 import { buildMatch, truncateForEmbedding } from "./query.js";
 import { mergeArms, orderForReturn, rankArm, RRF_K } from "./merge.js";
-import { dot, ftsHits, textOf, vectorRows, writeTrace } from "./store.js";
+import { dot, embeddingCount, ftsHits, textOf, vectorRows, writeTrace } from "./store.js";
 
 /** How many memories a retrieval returns by default. Small on purpose: this text is injected into a prompt. */
 export const DEFAULT_K = 5;
@@ -46,6 +54,17 @@ export const ARM_LIMIT = 30;
  */
 export const RERANK_CAP = 30;
 
+/**
+ * How long one call to the runtime is given before retrieval goes on without
+ * it.
+ *
+ * It is not a guess at how long inference takes — #681 measured an embedding in
+ * tens of milliseconds and a 30-pair rerank in a few hundred. It is a ceiling on
+ * a runtime that is loading, wedged, or answering something else entirely, and
+ * it exists because the caller is a prompt on its way out.
+ */
+export const RUNTIME_TIMEOUT_MS = 5000;
+
 /** What `retrievals.query_source` records. The raw prompt, decided in #683; the column exists so an extracted query can be compared later. */
 export const QUERY_SOURCE = "raw-prompt";
 
@@ -60,7 +79,8 @@ export const LOCAL_BASIS = "local: no API spend";
  * @property {string[]} [status] Defaults to `['active']`, which is what excludes a superseded memory while its successor stays.
  * @property {string | null} [since]
  * @property {string | null} [until]
- * @property {number} [k]
+ * @property {number} [k] Clamped to `RERANK_CAP`; the trace records the number asked for.
+ * @property {number} [runtimeTimeoutMs] How long any one runtime call is given. Defaults to `RUNTIME_TIMEOUT_MS`.
  * @property {"prompt" | "tool" | "manual"} [origin]
  * @property {string | null} [sessionId]
  * @property {string | null} [turnId]
@@ -89,21 +109,30 @@ export const search = async (request, deps) => {
 
     const now = deps.now ?? (() => Date.now());
     const startedAt = now();
-    const k = Number.isInteger(request.k) && Number(request.k) > 0 ? Number(request.k) : DEFAULT_K;
     const filters = filtersOf(request, project);
     const match = buildMatch(request.query);
     const embedText = truncateForEmbedding(request.query);
+    const timeoutMs = Number.isFinite(request.runtimeTimeoutMs) && Number(request.runtimeTimeoutMs) > 0 ? Number(request.runtimeTimeoutMs) : RUNTIME_TIMEOUT_MS;
 
     const stages = { embed: null, fts: null, vector: null, rerank: null };
     const degradations = [];
     const notes = {};
+
+    // Asking for more than the reranker sees would return a tail nothing
+    // ranked, so `k` is clamped rather than quietly served from the merge order.
+    const asked = Number.isInteger(request.k) && Number(request.k) > 0 ? Number(request.k) : DEFAULT_K;
+    const k = Math.min(asked, RERANK_CAP);
+
+    if (k !== asked) {
+        notes.k_clamped_from = asked;
+    }
 
     // A query with no searchable term in it is not a degradation and not an
     // error: "ok", "thanks" and "y" are a large share of real prompts. It
     // returns nothing, spends nothing, and says why on the trace.
     if (match.empty) {
         return finish({
-            request, deps, filters, match, embedText, k, startedAt, now,
+            request, deps, filters, match, embedText, k, timeoutMs, startedAt, now,
             candidates: [], results: [], stages,
             degraded: null,
             notes: { ...notes, query_empty_reason: match.emptyReason },
@@ -117,9 +146,10 @@ export const search = async (request, deps) => {
 
     stages.fts = now() - ftsStarted;
 
-    const vector = await vectorArm({ request, deps, filters, embedText, now, stages, degradations, notes });
+    const runtime = await readiness(deps, timeoutMs);
+    const vector = await vectorArm({ deps, filters, embedText, runtime, timeoutMs, now, stages, degradations, notes });
     const merged = mergeArms({ fts, vector: vector.hits });
-    const reranked = await rerankArm({ deps, request, merged, now, stages, degradations, notes });
+    const reranked = await rerankArm({ deps, request, merged, runtime, timeoutMs, now, stages, degradations, notes });
     const ordered = orderForReturn(reranked.candidates, reranked.scores);
     const text = textOf(deps.db, ordered.map((candidate) => candidate.memoryId));
 
@@ -131,7 +161,7 @@ export const search = async (request, deps) => {
     ];
 
     return finish({
-        request, deps, filters, match, embedText, k, startedAt, now,
+        request, deps, filters, match, embedText, k, timeoutMs, startedAt, now,
         candidates: rows,
         results: returned.map((candidate) => resultOf(candidate, text)),
         stages,
@@ -151,7 +181,7 @@ export const search = async (request, deps) => {
  * never throws — and all of them mean the same thing to a caller: FTS5-only,
  * with `vector: unavailable` on the row.
  */
-const vectorArm = async ({ request, deps, filters, embedText, now, stages, degradations, notes }) => {
+const vectorArm = async ({ deps, filters, embedText, runtime, timeoutMs, now, stages, degradations, notes }) => {
     const unavailable = (reason) => {
         degradations.push("vector: unavailable");
         notes.vector_unavailable_reason = reason;
@@ -159,20 +189,12 @@ const vectorArm = async ({ request, deps, filters, embedText, now, stages, degra
         return { hits: [], excluded: [], scanned: 0, costs: [costOfNothing(`no query embedding: ${reason}`, "query-embed")] };
     };
 
-    if (deps.client === null || deps.client === undefined) {
-        return unavailable("no runtime client was given");
-    }
-
-    if (deps.ensureRuntime !== undefined) {
-        const ready = await deps.ensureRuntime();
-
-        if (!ready.ready) {
-            return unavailable(ready.reason ?? "the runtime did not become ready");
-        }
+    if (!runtime.ready) {
+        return unavailable(runtime.reason);
     }
 
     const embedStarted = now();
-    const embedded = await deps.client.embed([embedText.text], { kind: "query" });
+    const embedded = await withTimeout(() => deps.client.embed([embedText.text], { kind: "query" }), timeoutMs, "the query embedding");
 
     stages.embed = now() - embedStarted;
 
@@ -186,7 +208,23 @@ const vectorArm = async ({ request, deps, filters, embedText, now, stages, degra
     const scanStarted = now();
     const rows = vectorRows(deps.db, { filters, model: embedded.model });
     const queryVector = embedded.vectors[0];
-    const scored = rows.map((row) => ({ memoryId: row.memoryId, type: row.type, score: dot(queryVector, row.vector) }));
+
+    // A vector of another width is a vector from another model or another
+    // dtype, and a dot product over the shorter of the two is a number that
+    // looks like a similarity and is not one.
+    const comparable = rows.filter((row) => row.vector.length === queryVector.length);
+
+    if (comparable.length !== rows.length) {
+        notes.vectors_skipped_dim = rows.length - comparable.length;
+    }
+
+    // An empty arm on a database full of embeddings is a model change, not an
+    // empty corpus, and it is otherwise invisible: the results simply get worse.
+    if (rows.length === 0 && embeddingCount(deps.db) > 0) {
+        notes.vector_no_rows_for_model = embedded.model;
+    }
+
+    const scored = comparable.map((row) => ({ memoryId: row.memoryId, type: row.type, score: dot(queryVector, row.vector) }));
     const wanted = filters.types === null ? scored : scored.filter((row) => filters.types.includes(row.type));
 
     stages.vector = now() - scanStarted;
@@ -200,6 +238,67 @@ const vectorArm = async ({ request, deps, filters, embedText, now, stages, degra
 };
 
 /**
+ * Whether the runtime is worth calling at all, asked once per retrieval.
+ *
+ * Both arms share the answer. Asking the reranker after the autostart already
+ * said the daemon is not there is a guaranteed wait for a guaranteed failure,
+ * and it was exactly what the first cut of this file did.
+ *
+ * @returns {Promise<{ ready: boolean, reason?: string }>}
+ */
+const readiness = async (deps, timeoutMs) => {
+    if (deps.client === null || deps.client === undefined) {
+        return { ready: false, reason: "no runtime client was given" };
+    }
+
+    if (deps.ensureRuntime === undefined) {
+        return { ready: true };
+    }
+
+    const answer = await withTimeout(
+        async () => ({ ok: true, value: await deps.ensureRuntime() }),
+        timeoutMs,
+        "the runtime start",
+    );
+
+    if (!answer.ok) {
+        return { ready: false, reason: answer.reason };
+    }
+
+    return answer.value.ready ? { ready: true } : { ready: false, reason: answer.value.reason ?? "the runtime did not become ready" };
+};
+
+/**
+ * One call to the runtime, bounded.
+ *
+ * The client never throws, so the only thing it can do wrong is take too long,
+ * and it can: `/health` reports a load that has started as ready, and the
+ * client's own socket timeout is twenty seconds. A call that overruns comes
+ * back as the same `{ ok: false, reason }` shape as any other failure, so every
+ * caller degrades through one path. The call itself is abandoned rather than
+ * cancelled — the runtime keeps loading, and the next retrieval gets the
+ * benefit of it.
+ *
+ * @template T
+ * @param {() => Promise<T>} call
+ * @param {number} ms
+ * @param {string} what
+ * @returns {Promise<T | { ok: false, reason: string }>}
+ */
+const withTimeout = async (call, ms, what) => {
+    let timer = null;
+    const expired = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, reason: `${what} did not answer within ${ms} ms` }), ms);
+    });
+
+    try {
+        return await Promise.race([call(), expired]);
+    } finally {
+        if (timer !== null) clearTimeout(timer);
+    }
+};
+
+/**
  * The reranker over the capped candidate set, and the merged order when it is
  * not there.
  *
@@ -207,33 +306,34 @@ const vectorArm = async ({ request, deps, filters, embedText, now, stages, degra
  * comparable only inside one call, so they order this call's candidates and
  * mean nothing outside it.
  */
-const rerankArm = async ({ deps, request, merged, now, stages, degradations, notes }) => {
+const rerankArm = async ({ deps, request, merged, runtime, timeoutMs, now, stages, degradations, notes }) => {
     const capped = merged.slice(0, RERANK_CAP);
+
+    const unavailable = (reason) => {
+        degradations.push("rerank: unavailable");
+        notes.rerank_unavailable_reason = reason;
+
+        return { candidates: capped, scores: null, count: 0, costs: [costOfNothing(`no model call: ${reason}`, "rerank")] };
+    };
 
     if (capped.length === 0) {
         return { candidates: capped, scores: null, count: 0, costs: [costOfNothing("no model call: no candidates to rerank", "rerank")] };
     }
 
-    if (deps.client === null || deps.client === undefined) {
-        degradations.push("rerank: unavailable");
-        notes.rerank_unavailable_reason = "no runtime client was given";
-
-        return { candidates: capped, scores: null, count: 0, costs: [costOfNothing("no model call: no runtime client was given", "rerank")] };
+    if (!runtime.ready) {
+        return unavailable(runtime.reason);
     }
 
     const text = textOf(deps.db, capped.map((candidate) => candidate.memoryId));
     const documents = capped.map((candidate) => documentFor(text.get(candidate.memoryId)));
 
     const started = now();
-    const ranked = await deps.client.rerank(truncateForEmbedding(request.query).text, documents);
+    const ranked = await withTimeout(() => deps.client.rerank(truncateForEmbedding(request.query).text, documents), timeoutMs, "the rerank");
 
     stages.rerank = now() - started;
 
     if (!ranked.ok) {
-        degradations.push("rerank: unavailable");
-        notes.rerank_unavailable_reason = ranked.reason;
-
-        return { candidates: capped, scores: null, count: 0, costs: [costOfNothing(`no model call: ${ranked.reason}`, "rerank")] };
+        return unavailable(ranked.reason);
     }
 
     const scores = new Map(capped.map((candidate, index) => [candidate.memoryId, ranked.scores[index]]));
@@ -405,7 +505,7 @@ const summaryCost = (calls) => {
 };
 
 /** Writes the trace and answers the caller. The one place a `retrievals` row is built. */
-const finish = ({ request, deps, filters, match, embedText, k, startedAt, now, candidates, results, stages, degraded, notes, costs, vectorsScanned, counts }) => {
+const finish = ({ request, deps, filters, match, embedText, k, timeoutMs, startedAt, now, candidates, results, stages, degraded, notes, costs, vectorsScanned, counts }) => {
     const msTotal = now() - startedAt;
     const retrieval = {
         at: (deps.at ?? (() => new Date().toISOString()))(),
@@ -414,7 +514,7 @@ const finish = ({ request, deps, filters, match, embedText, k, startedAt, now, c
         origin: originOf(request.origin),
         query_text: request.query ?? "",
         query_source: QUERY_SOURCE,
-        filters: JSON.stringify(traceFilters(filters, match, embedText, vectorsScanned, notes)),
+        filters: JSON.stringify(traceFilters(filters, match, embedText, vectorsScanned, timeoutMs, notes)),
         k,
         fts_n: counts?.fts ?? 0,
         vector_n: counts?.vector ?? 0,
@@ -453,7 +553,7 @@ const finish = ({ request, deps, filters, match, embedText, k, startedAt, now, c
  * as applied, the exact MATCH expression, how the query was cut, and how many
  * vectors the brute-force arm read.
  */
-const traceFilters = (filters, match, embedText, vectorsScanned, notes) => ({
+const traceFilters = (filters, match, embedText, vectorsScanned, timeoutMs, notes) => ({
     project: filters.project,
     status: filters.status,
     types: filters.types,
@@ -469,6 +569,7 @@ const traceFilters = (filters, match, embedText, vectorsScanned, notes) => ({
     arm_limit: ARM_LIMIT,
     rerank_cap: RERANK_CAP,
     rrf_k: RRF_K,
+    runtime_timeout_ms: timeoutMs,
     ...notes,
 });
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { explain } from "../retrieval/explain.js";
 import { DEFAULT_K, search } from "../retrieval/search.js";
-import { fakeClient, insertMemory, withDb } from "./retrieval-fixtures.js";
+import { FAKE_EMBED_MODEL, fakeClient, insertEmbedding, insertMemory, withDb } from "./retrieval-fixtures.js";
 
 const PROJECT = "host/owner/alpha";
 const OTHER = "host/owner/beta";
@@ -440,6 +440,127 @@ describe("the trace is complete enough to explain the answer", () => {
 
             assert.equal(rendered.ok, false);
             assert.match(rendered.reason, /no retrieval 4242/u);
+        });
+    });
+});
+
+describe("a runtime that answers and then does not", () => {
+    // /health reports a load that has *begun* as ready, so a daemon can pass
+    // the autostart and then sit on the first /embed for as long as its ONNX
+    // sessions take. Measured on this box: ready at 701 ms uptime, embedding
+    // long after. Without a call timeout the prompt waits on the client's own
+    // twenty seconds.
+    it("bounds an embed that never answers and degrades with the timeout as the reason", async () => {
+        await withDb(async ({ db }) => {
+            const ids = seed(db);
+            const answer = await search(
+                { query: QUERY, project: PROJECT, runtimeTimeoutMs: 25 },
+                { db, client: client({ embedHangs: true }) },
+            );
+            const row = retrievalOf(db, answer.retrievalId);
+
+            assert.match(row.degraded, /vector: unavailable/u);
+            assert.match(JSON.parse(row.filters).vector_unavailable_reason, /did not answer within 25 ms/u);
+            assert.ok(answer.results.length > 0, "the lexical arm still answers");
+            assert.ok(!answer.results.some((result) => result.memoryId === ids.semantic));
+        });
+    });
+
+    it("bounds a rerank that never answers and keeps the merged order", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const answer = await search(
+                { query: QUERY, project: PROJECT, runtimeTimeoutMs: 25 },
+                { db, client: client({ rerankHangs: true }) },
+            );
+            const row = retrievalOf(db, answer.retrievalId);
+
+            assert.match(row.degraded, /rerank: unavailable/u);
+            assert.match(JSON.parse(row.filters).rerank_unavailable_reason, /did not answer within 25 ms/u);
+            assert.ok(answer.results.length > 0);
+        });
+    });
+
+    // The reranker is behind the same daemon the autostart just gave up on.
+    // Posting to it anyway buys a second full timeout for an answer already
+    // known.
+    it("does not call the reranker after the autostart said the runtime is not there", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const runtime = client();
+            const answer = await search(
+                { query: QUERY, project: PROJECT },
+                { db, client: runtime, ensureRuntime: async () => ({ ready: false, reason: "runtime: autostart attempted 12s ago, not ready" }) },
+            );
+            const filters = JSON.parse(retrievalOf(db, answer.retrievalId).filters);
+
+            assert.equal(runtime.calls.rerank.length, 0, "the reranker is on the daemon that is not there");
+            assert.equal(runtime.calls.embed.length, 0);
+            assert.equal(retrievalOf(db, answer.retrievalId).degraded, "vector: unavailable; rerank: unavailable");
+            assert.equal(filters.rerank_unavailable_reason, "runtime: autostart attempted 12s ago, not ready");
+            assert.equal(filters.vector_unavailable_reason, "runtime: autostart attempted 12s ago, not ready");
+        });
+    });
+});
+
+describe("vectors that cannot be compared", () => {
+    // Renaming or upgrading the embedding model empties the vector arm on a
+    // database full of vectors, and nothing else says so: the results simply
+    // get quietly worse.
+    it("names the model when the corpus has embeddings and none of them are this model's", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const answer = await search(
+                { query: QUERY, project: PROJECT },
+                { db, client: client({ embedModel: "bge-small-en-v1.5/fp32@rev2" }) },
+            );
+            const row = retrievalOf(db, answer.retrievalId);
+
+            assert.equal(row.vector_n, 0);
+            assert.equal(JSON.parse(row.filters).vector_no_rows_for_model, "bge-small-en-v1.5/fp32@rev2");
+            assert.equal(row.degraded, null, "an empty arm is not a degradation; the runtime answered");
+            assert.match(explain(db, answer.retrievalId).text, /no stored embedding matches the model that answered/u);
+        });
+    });
+
+    // A dot product over the shorter of two widths is a number that looks like
+    // a similarity and is not one, so a 384-wide corpus with one 768-wide row
+    // must drop the row rather than score it on its first 384 dimensions.
+    it("skips a stored vector of another width and counts it on the trace", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const narrow = insertMemory(db, { project: PROJECT, title: "Stash and worktree", body: "Another matching memory." });
+
+            insertEmbedding(db, narrow, [1, 0], FAKE_EMBED_MODEL);
+
+            const answer = await search({ query: QUERY, project: PROJECT }, { db, client: client() });
+            const row = retrievalOf(db, answer.retrievalId);
+            const candidate = candidatesOf(db, answer.retrievalId).find((each) => each.memory_id === narrow);
+
+            assert.equal(JSON.parse(row.filters).vectors_skipped_dim, 1);
+            assert.equal(candidate.from_vector, 0, "the mismatched row is a lexical candidate and nothing more");
+            assert.equal(candidate.vector_score, null);
+            assert.match(explain(db, answer.retrievalId).text, /1 vector\(s\) skipped/u);
+        });
+    });
+});
+
+describe("k beyond what the reranker sees", () => {
+    it("clamps k to the rerank cap and records what was asked for", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const answer = await search({ query: QUERY, project: PROJECT, k: 100 }, { db, client: client() });
+            const row = retrievalOf(db, answer.retrievalId);
+
+            assert.equal(row.k, 30);
+            assert.equal(JSON.parse(row.filters).k_clamped_from, 100);
+            assert.ok(answer.results.length <= 30);
+            assert.match(explain(db, answer.retrievalId).text, /k was 100, clamped to the rerank cap/u);
         });
     });
 });

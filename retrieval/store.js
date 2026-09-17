@@ -136,6 +136,18 @@ export const vectorRows = (db, spec) => {
 };
 
 /**
+ * How many embeddings the database holds, of any model.
+ *
+ * It answers one question and only gets asked when the vector arm came back
+ * empty: is this a corpus with no vectors in it, or a corpus whose vectors were
+ * all written by a different model than the one that just answered?
+ *
+ * @param {import("bun:sqlite").Database} db
+ * @returns {number}
+ */
+export const embeddingCount = (db) => db.query("SELECT count(*) AS n FROM embeddings").get().n;
+
+/**
  * A stored embedding as floats.
  *
  * The copy when the blob is not four-byte aligned is not optional: a

@@ -4,7 +4,7 @@
  *
  *     bun retrieval/search-cli.js <db> --project P --query "..." [--k 5]
  *         [--types user,project] [--status active] [--since ISO] [--until ISO]
- *         [--origin manual|prompt|tool] [--no-runtime] [--with-id]
+ *         [--origin manual|prompt|tool] [--runtime-timeout-ms N] [--no-runtime] [--with-id]
  *
  * No Claude Code session, no hook, no plugin: this is the same `search()` the
  * prompt hook will call in #684, with a database path instead of a session.
@@ -21,11 +21,30 @@
  */
 
 import { openMemoryDb } from "../schema/bun-sqlite.js";
-import { bunFetchText, createClient } from "../runtime/client.js";
+import { createClient } from "../runtime/client.js";
 import { ensureRuntime } from "./ensure-runtime.js";
-import { search } from "./search.js";
+import { RUNTIME_TIMEOUT_MS, search } from "./search.js";
 
-const USAGE = "usage: bun retrieval/search-cli.js <db> --project P --query \"...\" [--k N] [--types a,b] [--status a,b] [--since ISO] [--until ISO] [--origin manual|prompt|tool] [--no-runtime] [--with-id]";
+const USAGE = "usage: bun retrieval/search-cli.js <db> --project P --query \"...\" [--k N] [--types a,b] [--status a,b] [--since ISO] [--until ISO] [--origin manual|prompt|tool] [--runtime-timeout-ms N] [--no-runtime] [--with-id]";
+
+/**
+ * `fetch` with the same ceiling `search()` races its calls against, so a
+ * runtime that never answers loses its socket as well as its turn. Without it
+ * the abandoned request would sit on the client's own twenty-second timeout
+ * after retrieval has already moved on.
+ *
+ * @param {number} timeoutMs
+ */
+const boundedFetchText = (timeoutMs) => async (url, init = {}) => {
+    const response = await fetch(url, {
+        method: init.method ?? "GET",
+        headers: init.headers,
+        body: init.body,
+        signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    return { status: response.status, ok: response.ok, text: await response.text() };
+};
 
 const main = async () => {
     const argv = process.argv.slice(2);
@@ -41,8 +60,9 @@ const main = async () => {
         return fail(USAGE);
     }
 
+    const timeoutMs = flags["runtime-timeout-ms"] === undefined ? RUNTIME_TIMEOUT_MS : Number.parseInt(flags["runtime-timeout-ms"], 10);
     const opened = openMemoryDb(dbPath);
-    const client = flags["no-runtime"] === true ? null : createClient({ fetchText: bunFetchText });
+    const client = flags["no-runtime"] === true ? null : createClient({ fetchText: boundedFetchText(timeoutMs) });
 
     try {
         const answer = await search(
@@ -55,11 +75,12 @@ const main = async () => {
                 until: flags.until ?? null,
                 k: flags.k === undefined ? undefined : Number.parseInt(flags.k, 10),
                 origin: /** @type {any} */ (flags.origin ?? "manual"),
+                runtimeTimeoutMs: timeoutMs,
             },
             {
                 db: opened.db,
                 client,
-                ensureRuntime: client === null ? undefined : () => ensureRuntime({ client }),
+                ensureRuntime: client === null ? undefined : () => ensureRuntime({ client, stampPath: `${dbPath}.autostart` }),
             },
         );
 

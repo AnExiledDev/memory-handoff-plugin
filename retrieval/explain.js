@@ -55,12 +55,34 @@ const header = (retrieval, filters) => [
     `match        ${filters.match_expression === "" || filters.match_expression === undefined ? "(none)" : filters.match_expression}`,
     ...(filters.query_empty_reason === undefined ? [] : [`             nothing searchable: ${filters.query_empty_reason}`]),
     `filters      project=${filters.project}  status=${list(filters.status)}  types=${list(filters.types)}  since=${filters.since ?? "-"}  until=${filters.until ?? "-"}`,
-    `constants    rrf_k=${filters.rrf_k ?? "-"}  arm_limit=${filters.arm_limit ?? "-"}  rerank_cap=${filters.rerank_cap ?? "-"}`,
+    `constants    rrf_k=${filters.rrf_k ?? "-"}  arm_limit=${filters.arm_limit ?? "-"}  rerank_cap=${filters.rerank_cap ?? "-"}  runtime_timeout=${filters.runtime_timeout_ms === undefined ? "-" : `${filters.runtime_timeout_ms}ms`}`,
     `counts       fts=${retrieval.fts_n}  vector=${retrieval.vector_n}  merged=${retrieval.merged_n}  reranked=${retrieval.reranked_n}  returned=${retrieval.returned_n}  vectors_scanned=${filters.vectors_scanned ?? "-"}`,
     `timing       total=${ms(retrieval.ms_total)}  embed=${ms(retrieval.ms_embed)}  fts=${ms(retrieval.ms_fts)}  vector=${ms(retrieval.ms_vector)}  rerank=${ms(retrieval.ms_rerank)}`,
+    ...quietFindings(filters),
     `degraded     ${retrieval.degraded ?? "no"}`,
     ...degradationReasons(filters),
 ];
+
+/**
+ * The things that changed the answer without degrading anything.
+ *
+ * A model rename empties the vector arm, a mixed-width corpus drops rows, and a
+ * clamped `k` returns fewer than the caller asked for. None of the three is a
+ * failure and all three are invisible in the results, which is exactly the kind
+ * of thing this page exists to say out loud.
+ */
+const quietFindings = (filters) =>
+    [
+        filters.vector_no_rows_for_model === undefined
+            ? null
+            : `             no stored embedding matches the model that answered (${filters.vector_no_rows_for_model}); the vector arm was empty`,
+        filters.vectors_skipped_dim === undefined
+            ? null
+            : `             ${filters.vectors_skipped_dim} vector(s) skipped: stored width is not the query's width`,
+        filters.k_clamped_from === undefined
+            ? null
+            : `             k was ${filters.k_clamped_from}, clamped to the rerank cap`,
+    ].filter((line) => line !== null);
 
 /** @param {any[]} candidates @returns {string[]} */
 const candidateTable = (candidates) => {
