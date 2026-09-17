@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { explain } from "../retrieval/explain.js";
 import { DEFAULT_K, search } from "../retrieval/search.js";
+import { DEPENDENCY_MISSING_REASON } from "../runtime/infer.js";
 import { FAKE_EMBED_MODEL, fakeClient, insertEmbedding, insertMemory, withDb } from "./retrieval-fixtures.js";
 
 const PROJECT = "host/owner/alpha";
@@ -505,6 +506,25 @@ describe("a runtime that answers and then does not", () => {
             assert.equal(retrievalOf(db, answer.retrievalId).degraded, "vector: unavailable; rerank: unavailable");
             assert.equal(filters.rerank_unavailable_reason, "runtime: autostart attempted 12s ago, not ready");
             assert.equal(filters.vector_unavailable_reason, "runtime: autostart attempted 12s ago, not ready");
+        });
+    });
+
+    // The marketplace-install case: the copy has no `node_modules`, so the
+    // trace has to say that rather than "the runtime was not ready", which
+    // names nothing anybody can act on.
+    it("carries the missing-dependency reason onto the row", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const answer = await search(
+                { query: QUERY, project: PROJECT },
+                { db, client: client(), ensureRuntime: async () => ({ ready: false, reason: DEPENDENCY_MISSING_REASON }) },
+            );
+            const row = retrievalOf(db, answer.retrievalId);
+
+            assert.ok(answer.results.length > 0, "FTS5 still answers");
+            assert.match(row.degraded, /vector: unavailable/u);
+            assert.equal(JSON.parse(row.filters).vector_unavailable_reason, DEPENDENCY_MISSING_REASON);
         });
     });
 });

@@ -23,18 +23,49 @@
  * monitor tick, a Laravel container and agent waves. ONNX takes every core it
  * can see by default, which turns one embed into real interference with work
  * somebody is waiting on.
+ *
+ * **The engine is imported inside the load, not at the top of this file.** A
+ * marketplace install copies this directory with no `node_modules`, so the one
+ * dependency is absent until somebody runs `bun runtime/install.js`. A static
+ * import would take the daemon down before it could listen, and the caller
+ * would see a timeout rather than the cause; this way `health()` names the
+ * missing dependency and retrieval degrades with that reason on the row.
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { AutoModel, AutoModelForSequenceClassification, AutoTokenizer, env } from "@huggingface/transformers";
-
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 /** The pinned weights, and the only place a model id or a revision is written. */
 export const MODELS = JSON.parse(readFileSync(join(HERE, "models.json"), "utf8"));
+
+/** The one runtime dependency, and the only place its name is written. */
+export const RUNTIME_DEPENDENCY = "@huggingface/transformers";
+
+/** What `health()` answers, and what a load throws, when that dependency is not installed. */
+export const DEPENDENCY_MISSING_REASON = `dependencies missing (${RUNTIME_DEPENDENCY}): run bun runtime/install.js`;
+
+/**
+ * Whether the engine can be imported at all, answered without importing it.
+ *
+ * Resolution is relative to this file, so it finds the `node_modules` beside
+ * the plugin the daemon was started from rather than the caller's cwd, which
+ * inside a hook is whatever project the session is open on.
+ *
+ * @param {(specifier: string) => string} [resolve]
+ * @returns {boolean}
+ */
+export const dependencyInstalled = (resolve = (specifier) => import.meta.resolve(specifier)) => {
+    try {
+        resolve(RUNTIME_DEPENDENCY);
+    } catch {
+        return false;
+    }
+
+    return true;
+};
 
 /** How many cores one session may take. See the file header. */
 export const INTRA_OP_THREADS = 2;
@@ -52,6 +83,7 @@ export const INTRA_OP_THREADS = 2;
  * @property {Dtype} [embedDtype]
  * @property {Dtype} [rerankDtype]
  * @property {number} [threads]
+ * @property {(specifier: string) => string} [resolveDependency] How `health()` decides the engine is installed. Injected by the tests.
  */
 
 /**
@@ -270,6 +302,13 @@ export const createRuntime = (options = {}) => {
             };
             const missing = missingWeights(modelsDir, embedDtype, rerankDtype);
 
+            // The dependency comes first because it is the one nothing else can
+            // work around: without the engine the weights on disk are 166 MB
+            // nobody can load, and the same command fixes both.
+            if (!dependencyInstalled(options.resolveDependency)) {
+                return { ready: false, ...base, reason: DEPENDENCY_MISSING_REASON };
+            }
+
             if (missing.length > 0) {
                 return { ready: false, ...base, reason: `weights missing (${missing.length} files): run bun runtime/install.js` };
             }
@@ -305,6 +344,8 @@ const rerankName = (dtype) => `${MODELS.rerank.id}@${MODELS.rerank.revision.slic
  * @param {{ modelsDir: string, device: Device, embedDtype: Dtype, rerankDtype: Dtype, threads: number }} spec
  */
 const loadBoth = async (spec) => {
+    const { AutoModel, AutoModelForSequenceClassification, AutoTokenizer, env } = await importEngine();
+
     // transformers.js keeps this configuration on one process-global object, so
     // it is written here, immediately before the sessions are built, rather
     // than when a runtime is constructed: two runtimes over two directories in
@@ -342,6 +383,20 @@ const loadBoth = async (spec) => {
         embed: { tokenizer: embedTokenizer, model: embedModel },
         rerank: { tokenizer: rerankTokenizer, model: rerankModel },
     };
+};
+
+/**
+ * The engine, imported at load time. See the file header for why it is not at
+ * the top: an absent `node_modules` must be a reason, not a dead process.
+ *
+ * @returns {Promise<any>}
+ */
+const importEngine = async () => {
+    try {
+        return await import(RUNTIME_DEPENDENCY);
+    } catch (error) {
+        throw new Error(`${DEPENDENCY_MISSING_REASON} (${error instanceof Error ? error.message : String(error)})`);
+    }
 };
 
 /**
