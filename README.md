@@ -138,6 +138,49 @@ first two cost a run each to find:
   result shapes are not uniform: `tool.register` wants `{ value }` and
   `session.start` wants `{ cwd }`.
 
+## The eval suite
+
+`evals/` is a third runner, and unlike the two above it costs money and answers
+a different question: not whether the code is right, but whether an agent that
+has this plugin loaded actually reaches for it.
+
+```bash
+claude plugin eval . --ablation with-without --no-publish \
+  --allow-tools 'mcp__memory-handoff__*'
+```
+
+Three cases, two runs each, both arms: about **$0.56** a suite on 2.1.274, and
+no LLM graders at all, which is why it is that cheap. Every grader is `regex` or
+`tool_used`, so the whole score is free and the only spend is the agent runs
+themselves. The headline number is Δ, the with-plugin score minus the no-plugin
+baseline.
+
+- `01-memory-status` asks whether memory is live and where it keeps its data. Δ
+  +1.00, which is the cleanest signal in here: without the plugin there is no
+  way to answer it at all.
+- `02-list-memories` asks for everything remembered about the project. Δ +0.50,
+  and the shortfall is a real finding rather than noise — see below.
+- `03-neg-plain-question` asks for 17 × 23. Δ 0.00 on purpose: it is the guard
+  that having these tools loaded does not make an agent call them at a prompt
+  that has nothing to do with them.
+
+**The measured gap: an agent's first instinct is the filesystem, and a denial
+can end the attempt.** Across seven runs of `02-list-memories`, one agent
+globbed the project's memory directory, was refused by the sandbox, and stopped
+there — "I don't have permission to access the memory directory for this
+project, so I can't read" — without ever trying `memory_list`. The other six
+made the fallback explicitly, one of them narrating it: "Direct filesystem
+access to the memory directory is blocked, but there's a memory-handoff MCP tool
+available for this." The store is reachable only through these tools, and
+nothing in the tool text says so, so roughly one reader in seven is told their
+memories are unreadable when they are one call away. Tracked as a change to the
+tool descriptions rather than fixed blind, because injected text is measured
+against `bench/` and not guessed at.
+
+A negative case is not padding. A plugin that fires on everything is a
+regression this suite is meant to go red on, and `tool_used` with `min: 0`,
+`max: 0` and `arm: both` is the shape that catches it.
+
 ## Working beside compact-handoff
 
 [compact-handoff](https://github.com/AnExiledDev/compact-handoff-plugin) replaces

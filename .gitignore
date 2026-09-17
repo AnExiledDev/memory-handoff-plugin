@@ -2,4 +2,5 @@
 .runs/
 .verify/
 __pycache__/
+evals/results/
 node_modules/
