@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { Database } from "bun:sqlite";
 
-import { buildMatch, MAX_MATCH_TOKENS, MAX_QUERY_CHARS, quoteToken, truncateForEmbedding } from "../retrieval/query.js";
+import { buildMatch, MAX_MATCH_TOKENS, MAX_QUERY_CHARS, MAX_RERANK_QUERY_CHARS, quoteToken, truncateForEmbedding, truncateForRerank } from "../retrieval/query.js";
 
 /** A throwaway FTS5 table, so "this expression is valid" is a fact and not a hope. */
 const withFts = (run) => {
@@ -104,6 +104,25 @@ describe("a pasted stack trace", () => {
 
     it("leaves a short query alone and reports no truncation", () => {
         const cut = truncateForEmbedding("how do I turn on WAL mode");
+
+        assert.equal(cut.truncated, false);
+        assert.equal(cut.text, "how do I turn on WAL mode");
+    });
+
+    // #711. The reranker pays per character on every candidate and shares one
+    // 512-token sequence with the memory, so its window is the narrower one.
+    it("is cut harder before it reaches the reranker", () => {
+        const cut = truncateForRerank(trace);
+
+        assert.ok(MAX_RERANK_QUERY_CHARS < MAX_QUERY_CHARS);
+        assert.equal(cut.truncated, true);
+        assert.equal(cut.text.length, MAX_RERANK_QUERY_CHARS);
+        assert.equal(cut.chars, trace.length);
+        assert.equal(cut.text, truncateForEmbedding(trace).text.slice(0, MAX_RERANK_QUERY_CHARS));
+    });
+
+    it("leaves a query inside the rerank window alone", () => {
+        const cut = truncateForRerank("how do I turn on WAL mode");
 
         assert.equal(cut.truncated, false);
         assert.equal(cut.text, "how do I turn on WAL mode");

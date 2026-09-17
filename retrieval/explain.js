@@ -55,7 +55,7 @@ const header = (retrieval, filters) => [
     `match        ${filters.match_expression === "" || filters.match_expression === undefined ? "(none)" : filters.match_expression}`,
     ...(filters.query_empty_reason === undefined ? [] : [`             nothing searchable: ${filters.query_empty_reason}`]),
     `filters      project=${filters.project}  status=${list(filters.status)}  types=${list(filters.types)}  since=${filters.since ?? "-"}  until=${filters.until ?? "-"}`,
-    `constants    rrf_k=${filters.rrf_k ?? "-"}  arm_limit=${filters.arm_limit ?? "-"}  rerank_cap=${filters.rerank_cap ?? "-"}  runtime_timeout=${filters.runtime_timeout_ms === undefined ? "-" : `${filters.runtime_timeout_ms}ms`}`,
+    `constants    rrf_k=${filters.rrf_k ?? "-"}  arm_limit=${filters.arm_limit ?? "-"}  rerank_cap=${filters.rerank_cap ?? "-"}  rerank_query_chars=${filters.rerank_query_chars ?? "-"}  runtime_timeout=${filters.runtime_timeout_ms === undefined ? "-" : `${filters.runtime_timeout_ms}ms`}`,
     `counts       fts=${retrieval.fts_n}  vector=${retrieval.vector_n}  merged=${retrieval.merged_n}  reranked=${retrieval.reranked_n}  returned=${retrieval.returned_n}  vectors_scanned=${filters.vectors_scanned ?? "-"}`,
     `timing       total=${ms(retrieval.ms_total)}  embed=${ms(retrieval.ms_embed)}  fts=${ms(retrieval.ms_fts)}  vector=${ms(retrieval.ms_vector)}  rerank=${ms(retrieval.ms_rerank)}`,
     ...quietFindings(filters),
@@ -82,6 +82,9 @@ const quietFindings = (filters) =>
         filters.k_clamped_from === undefined
             ? null
             : `             k was ${filters.k_clamped_from}, clamped to the rerank cap`,
+        filters.rerank_query_truncated === true
+            ? `             the reranker saw the first ${filters.rerank_query_truncated_to} characters of a ${filters.query_chars}-character query; the FTS5 arm saw all of it`
+            : null,
     ].filter((line) => line !== null);
 
 /** @param {any[]} candidates @returns {string[]} */

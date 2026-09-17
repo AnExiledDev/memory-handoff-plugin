@@ -1262,11 +1262,15 @@ worth arriving.
   vector arm ranks first and the cross-encoder then demotes below three
   unrelated memories, in a score band where the reranker is saying nothing
   matches at all.
-- A pasted log costs more rerank time than a prompt is allowed to spend. Thirty
-  pairs against a 2000-character query took 9.1 s on this box, past the 5000 ms
-  ceiling on one runtime call, so the answer comes back in merge order with
-  `rerank: unavailable`. Retrieval still answers, and the bench's long-prompt
-  query is labelled as expecting it rather than pretending otherwise.
+- The reranker sees the first 600 characters of a prompt, not the whole of it.
+  It is a cross-encoder paying one forward pass per candidate, and it shares a
+  512-token sequence with the memory it is scoring: measured on this box
+  2026-09-17, thirty pairs took 6.6 s against a 2000-character query and 1.3 s
+  against 600, and 2000 characters of query left 122 of those 512 tokens for the
+  memory. So a pasted log used to overrun the 5000 ms ceiling on one runtime
+  call and come back in merge order; now it is cut, reranked inside the ceiling,
+  and the cut is on the trace as `rerank_query_truncated`. The FTS5 arm still
+  sees the whole prompt, so a word only in the cut tail still reaches the merge.
 - A reply with no `<memories>` block is recorded and dropped. Nothing asks
   again, so a bad generation costs you that compaction's memories entirely.
 - `$.model.fork` is always null headless, the engine says so in its log, so

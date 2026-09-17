@@ -46,6 +46,30 @@ export const MAX_MATCH_TOKENS = 32;
 export const MAX_QUERY_CHARS = 2000;
 
 /**
+ * How much of the prompt the reranker sees.
+ *
+ * Smaller than the embedder's window for two reasons, both measured on this box
+ * on 2026-09-17 (30 candidates, the shipped int8 jina-reranker-v1-tiny-en).
+ *
+ * **Cost.** The reranker is a cross-encoder: one forward pass per (query,
+ * document) pair, linear in query length. Thirty pairs took 6.6 s against 2000
+ * characters and 1.3 s against 600, and `search()` gives any one runtime call
+ * 5000 ms because the caller is a prompt on its way out. At 2000 characters the
+ * call always lost that race, so a pasted log got merge order and no reranking
+ * at all.
+ *
+ * **The window.** Query and document share one 512-token sequence. 2000
+ * characters of query tokenise to 390, leaving 122 for the memory, so the
+ * reranker was scoring a prompt against a document it could barely see. 600
+ * characters tokenise to 123 and leave 389, which fits a memory's title and
+ * body whole.
+ *
+ * The FTS5 arm still sees the full prompt, so a distinguishing word in the cut
+ * tail reaches the merge order even when the reranker never sees it.
+ */
+export const MAX_RERANK_QUERY_CHARS = 600;
+
+/**
  * The words dropped before the MATCH is built. Deliberately short: this is a
  * stopword list, not a linguistic model, and every word removed from a query is
  * recall somebody cannot get back.
@@ -132,14 +156,35 @@ export const buildMatch = (query) => {
  * @param {string} query
  * @returns {{ text: string, truncated: boolean, chars: number }}
  */
-export const truncateForEmbedding = (query) => {
+export const truncateForEmbedding = (query) => cutTo(query, MAX_QUERY_CHARS);
+
+/**
+ * The prompt as the reranker will see it, cut to `MAX_RERANK_QUERY_CHARS`.
+ *
+ * A separate cut from the embedder's, and deliberately so: the two models cost
+ * different amounts per character and divide the same 512-token window
+ * differently. See `MAX_RERANK_QUERY_CHARS`.
+ *
+ * @param {string} query
+ * @returns {{ text: string, truncated: boolean, chars: number }}
+ */
+export const truncateForRerank = (query) => cutTo(query, MAX_RERANK_QUERY_CHARS);
+
+/**
+ * One deterministic cut, from the front, reporting the length before it.
+ *
+ * @param {string} query
+ * @param {number} limit
+ * @returns {{ text: string, truncated: boolean, chars: number }}
+ */
+const cutTo = (query, limit) => {
     const raw = typeof query === "string" ? query : "";
 
-    if (raw.length <= MAX_QUERY_CHARS) {
+    if (raw.length <= limit) {
         return { text: raw, truncated: false, chars: raw.length };
     }
 
-    return { text: raw.slice(0, MAX_QUERY_CHARS), truncated: true, chars: raw.length };
+    return { text: raw.slice(0, limit), truncated: true, chars: raw.length };
 };
 
 /**
