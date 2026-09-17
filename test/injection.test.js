@@ -151,6 +151,22 @@ describe("what goes down with the prompt", () => {
         assert.equal(row.capChars, 4000);
     });
 
+    it("sends the prompt over stdin, never on the argv", async () => {
+        const host = fakeApi();
+        const runtime = await started(host);
+
+        await runtime.dispatch("prompt.submit", host.$, promptInput(), passThrough());
+
+        const call = host.childrenOf("search").at(0);
+
+        // `ps` is readable by everyone on the machine, and this argv carries
+        // whatever the person typed.
+        assert.equal(call.argv.includes("--query"), false);
+        assert.ok(call.argv.includes("--query-stdin"));
+        assert.equal(call.stdin, promptInput().text);
+        assert.equal(call.argv.join(" ").includes(promptInput().text), false);
+    });
+
     it("passes the session id down to the retrieval so the trace carries it", async () => {
         const host = fakeApi();
 
@@ -298,6 +314,18 @@ describe("the tools", () => {
         assert.equal(answer.results.length, 2);
         assert.equal(argv[argv.indexOf("--origin") + 1], "tool");
         assert.equal(argv[argv.indexOf("--k") + 1], "3");
+    });
+
+    it("memory_search sends its query over stdin too", async () => {
+        const host = fakeApi();
+
+        await call(host, "mcp__memory-handoff__memory_search", { query: "cron" });
+
+        const ran = host.childrenOf("search").at(0);
+
+        assert.equal(ran.argv.includes("--query"), false);
+        assert.ok(ran.argv.includes("--query-stdin"));
+        assert.equal(ran.stdin, "cron");
     });
 
     it("memory_search refuses a call with no query rather than searching for nothing", async () => {

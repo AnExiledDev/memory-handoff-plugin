@@ -6,6 +6,14 @@
  *         [--types user,project] [--status active] [--since ISO] [--until ISO]
  *         [--origin manual|prompt|tool] [--session-id ID] [--turn-id ID]
  *         [--runtime-timeout-ms N] [--no-runtime] [--with-id]
+ *     printf '%s' "..." | bun retrieval/search-cli.js <db> --project P --query-stdin
+ *
+ * `--query-stdin` reads the query off stdin instead of the argv, and is what
+ * every caller that did not type the query itself should use: a prompt-time
+ * retrieval's query is the prompt the person typed, and an argv is readable in
+ * `ps` by anyone on the machine. The whole of stdin is the query, with one
+ * trailing newline removed so a `printf '%s\n'` and a heredoc mean the same
+ * thing; nothing else is trimmed, because leading space can be the query.
  *
  * No Claude Code session, no hook, no plugin: this is the same `search()` the
  * prompt hook will call in #684, with a database path instead of a session.
@@ -26,7 +34,7 @@ import { createClient } from "../runtime/client.js";
 import { ensureRuntime } from "./ensure-runtime.js";
 import { RUNTIME_TIMEOUT_MS, search } from "./search.js";
 
-const USAGE = "usage: bun retrieval/search-cli.js <db> --project P --query \"...\" [--k N] [--types a,b] [--status a,b] [--since ISO] [--until ISO] [--origin manual|prompt|tool] [--session-id ID] [--turn-id ID] [--runtime-timeout-ms N] [--no-runtime] [--with-id]";
+const USAGE = "usage: bun retrieval/search-cli.js <db> --project P (--query \"...\" | --query-stdin) [--k N] [--types a,b] [--status a,b] [--since ISO] [--until ISO] [--origin manual|prompt|tool] [--session-id ID] [--turn-id ID] [--runtime-timeout-ms N] [--no-runtime] [--with-id]";
 
 /**
  * `fetch` with the same ceiling `search()` races its calls against, so a
@@ -57,8 +65,18 @@ const main = async () => {
 
     const flags = parseFlags(argv.slice(1));
 
-    if (flags.project === undefined || flags.query === undefined) {
+    if (flags.project === undefined) {
         return fail(USAGE);
+    }
+
+    const query = await queryOf(flags);
+
+    if (query === null) {
+        return fail(USAGE);
+    }
+
+    if (query.trim() === "") {
+        return fail("the query is empty");
     }
 
     const timeoutMs = flags["runtime-timeout-ms"] === undefined ? RUNTIME_TIMEOUT_MS : Number.parseInt(flags["runtime-timeout-ms"], 10);
@@ -68,7 +86,7 @@ const main = async () => {
     try {
         const answer = await search(
             {
-                query: flags.query,
+                query,
                 project: flags.project,
                 types: listOf(flags.types),
                 status: listOf(flags.status),
@@ -101,6 +119,22 @@ const main = async () => {
     } finally {
         opened.close();
     }
+};
+
+/**
+ * The query, off stdin when the caller asked for that and off the argv otherwise.
+ *
+ * One trailing newline is removed and nothing else, so the text a shell pipe
+ * carries and the text a hook writes to the child are the same query.
+ */
+const queryOf = async (flags) => {
+    if (flags["query-stdin"] === undefined) {
+        return typeof flags.query === "string" ? flags.query : null;
+    }
+
+    const text = await new Response(Bun.stdin.stream()).text();
+
+    return text.endsWith("\n") ? text.slice(0, -1) : text;
 };
 
 /** What stdout carries: the answer, and nothing that changes between two identical runs. */

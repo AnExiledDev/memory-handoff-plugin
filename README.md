@@ -753,13 +753,22 @@ is not a failure.
 ```
 bun retrieval/search-cli.js <db> --project P --query "..." [--k 5]
         [--types feedback,project] [--status active] [--since ISO] [--until ISO]
-        [--origin manual] [--no-runtime] [--with-id] [--runtime-timeout-ms 5000]
+        [--origin manual] [--session-id ID] [--turn-id ID]
+        [--no-runtime] [--with-id] [--runtime-timeout-ms 5000]
+printf '%s' "..." | bun retrieval/search-cli.js <db> --project P --query-stdin
 bun retrieval/explain-cli.js <db> <retrievalId> [--json]
 ```
 
 `search-cli` prints the results as JSON on stdout and the retrieval id on
 stderr, so two runs of the same query diff clean. `--no-runtime` skips the
 autostart, which is how the degraded path is exercised on purpose.
+
+`--query-stdin` reads the query off stdin instead of the argv, and is what every
+caller that did not type the query itself uses: a prompt-time query is the
+prompt the person typed, and an argv is readable in `ps` by anyone on the
+machine. The whole of stdin is the query, with one trailing newline removed so
+that a pipe and a hook mean the same thing. The two spellings are the same
+retrieval; a test asserts it byte for byte.
 
 `explain-cli` re-runs nothing. It reads the trace and renders it:
 
@@ -885,7 +894,8 @@ many candidates did not fit.
 
 ### When the retrieval does not answer
 
-The retrieval runs as a Bun child (`retrieval/search-cli.js`) bounded by
+The retrieval runs as a Bun child (`retrieval/search-cli.js`, handed the prompt
+over stdin rather than on its argv, where `ps` would show it) bounded by
 `MEMORY_HANDOFF_INJECT_TIMEOUT_MS`, 1500 ms by default, and the embedding
 runtime inside it is bounded lower still so it has time to write its own
 degraded row before it is killed. On a timeout, a non-zero exit or output that

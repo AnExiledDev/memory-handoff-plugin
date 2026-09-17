@@ -780,6 +780,9 @@ const paneEntry = (entry) => {
  * runtime wait inside it is set lower so the child still has time to write its
  * own degraded row before it is killed. `$.process.run` rejects on the timeout
  * rather than resolving with a code, which is why the call is wrapped.
+ *
+ * The query goes over stdin, never the argv: the query here is the prompt the
+ * person typed, and an argv is readable in `ps` by anyone on the machine.
  */
 const searchForPrompt = async ($, plan) => {
     const runtimeMs = Math.max(RUNTIME_FLOOR_MS, plan.caps.timeoutMs - RUNTIME_MARGIN_MS);
@@ -789,8 +792,7 @@ const searchForPrompt = async ($, plan) => {
         await dbFile($),
         "--project",
         plan.project,
-        "--query",
-        plan.query,
+        "--query-stdin",
         "--k",
         String(plan.caps.k),
         "--origin",
@@ -804,7 +806,7 @@ const searchForPrompt = async ($, plan) => {
     let ran = null;
 
     try {
-        ran = await $.process.run(argv, { timeoutMs: plan.caps.timeoutMs });
+        ran = await $.process.run(argv, { timeoutMs: plan.caps.timeoutMs, stdin: plan.query });
     } catch (error) {
         return { ok: false, reason: `the retrieval did not finish inside ${plan.caps.timeoutMs}ms: ${String(error).slice(0, 200)}` };
     }
@@ -931,7 +933,12 @@ const drawMemoryPane = async ($, e) => {
 
 /* ------------------------------------------------------------------- tools */
 
-/** A retrieval the model asked for, traced as `tool` rather than `prompt`. */
+/**
+ * A retrieval the model asked for, traced as `tool` rather than `prompt`.
+ *
+ * The query goes over stdin for the same reason the prompt's does: a search the
+ * model ran on somebody's words has no business in `ps`.
+ */
 const searchTool = async ($, e) => {
     const project = await projectFor($);
 
@@ -952,8 +959,7 @@ const searchTool = async ($, e) => {
         await dbFile($),
         "--project",
         project,
-        "--query",
-        query,
+        "--query-stdin",
         "--k",
         String(wholeNumber(e?.k, caps.k)),
         "--origin",
@@ -962,7 +968,7 @@ const searchTool = async ($, e) => {
         ...(typeof e?.types === "string" && e.types.trim() !== "" ? ["--types", e.types.trim()] : []),
         ...(Array.isArray(e?.types) && e.types.length > 0 ? ["--types", e.types.join(",")] : []),
     ];
-    const ran = await $.process.run(argv, { timeoutMs: TOOL_MS });
+    const ran = await $.process.run(argv, { timeoutMs: TOOL_MS, stdin: query });
 
     if (ran?.exitCode !== 0) {
         return { ok: false, reason: `the retrieval exited ${ran?.exitCode ?? "(no code)"}: ${(ran?.stderr ?? "").trim().slice(0, 500)}` };

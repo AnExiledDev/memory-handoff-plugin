@@ -1,6 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { explain } from "../retrieval/explain.js";
 import { DEFAULT_K, search } from "../retrieval/search.js";
 import { FAKE_EMBED_MODEL, fakeClient, insertEmbedding, insertMemory, withDb } from "./retrieval-fixtures.js";
@@ -561,6 +565,49 @@ describe("k beyond what the reranker sees", () => {
             assert.equal(JSON.parse(row.filters).k_clamped_from, 100);
             assert.ok(answer.results.length <= 30);
             assert.match(explain(db, answer.retrievalId).text, /k was 100, clamped to the rerank cap/u);
+        });
+    });
+});
+
+const SEARCH_CLI = join(fileURLToPath(import.meta.url), "..", "..", "retrieval", "search-cli.js");
+
+// The hooks pass the query over stdin because a prompt-time query is the prompt
+// the person typed and an argv is readable in `ps`. That is only safe if the
+// two ways of handing the CLI a query are the same retrieval.
+describe("the CLI takes its query off stdin as well as off the argv", () => {
+    const cli = (path, args, input) =>
+        spawnSync("bun", [SEARCH_CLI, path, "--project", PROJECT, "--no-runtime", ...args], { input, encoding: "utf8" });
+
+    it("answers a --query-stdin query exactly as it answers --query", async () => {
+        await withDb(async ({ db, path }) => {
+            seed(db);
+
+            const onArgv = cli(path, ["--query", QUERY]);
+            const onStdin = cli(path, ["--query-stdin"], QUERY);
+            const withNewline = cli(path, ["--query-stdin"], `${QUERY}\n`);
+
+            assert.equal(onArgv.status, 0, onArgv.stderr);
+            assert.equal(onStdin.status, 0, onStdin.stderr);
+            assert.ok(JSON.parse(onArgv.stdout).results.length > 0, "the fixture answers this query at all");
+
+            // Byte-identical: the retrieval id is the one thing that differs
+            // between two runs, and it is on stderr unless --with-id is given.
+            assert.equal(onStdin.stdout, onArgv.stdout);
+            assert.equal(withNewline.stdout, onArgv.stdout, "one trailing newline is the shell's, not the query's");
+        });
+    });
+
+    it("refuses a call with neither a query nor a stdin one", async () => {
+        await withDb(async ({ db, path }) => {
+            seed(db);
+
+            const missing = cli(path, []);
+            const empty = cli(path, ["--query-stdin"], "   \n");
+
+            assert.equal(missing.status, 1);
+            assert.match(missing.stderr, /--query-stdin/u);
+            assert.equal(empty.status, 1);
+            assert.match(empty.stderr, /the query is empty/u);
         });
     });
 });
