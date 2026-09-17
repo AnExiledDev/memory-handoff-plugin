@@ -27,22 +27,38 @@
  * this must be your own compaction plus a row.
  */
 
+import { parseReply } from "./parse.js";
+import { GENERATION_PROMPT } from "./prompt.js";
+
 /**
- * The extraction question, and a placeholder until #682 writes the real one.
+ * Which `generations.outcome` each index-row outcome is written as.
  *
- * It asks for JSON so the row can carry a count today and the parser has
- * something to sharpen against later. A fork that answers prose is still
- * stored whole; only `candidates` goes null.
+ * An outcome missing from here writes no database row at all: a refused raise
+ * is not a generation, and a rehearsal deliberately leaves the database alone,
+ * which is the whole of what rehearsing means.
+ *
+ * `extracted` covers an empty block as well as a full one, because a
+ * conversation that established nothing durable is a generation that worked:
+ * `wrote` with `memories_written = 0`. `empty` is the other thing, a reply that
+ * carried no block at all.
  */
-const EXTRACTION_PROMPT = `Read back over this conversation and list what would be worth remembering in a later session about this project: decisions that were made and why, constraints and preferences the person stated, and gotchas that cost time.
+const DB_OUTCOMES = {
+    extracted: "wrote",
+    empty: "empty",
+    cold: "cold",
+    threw: "failed",
+    subagent: "skipped",
+    precompute: "skipped",
+};
 
-Skip anything already obvious from reading the repository, and skip the state of the task you are in the middle of.
+/** How long the writer child may take before the generation is recorded without it. */
+const WRITE_MS = 20_000;
 
-Answer with JSON and nothing else, in this shape:
+/** How long a `git` reading may take before the project falls back to the cwd. */
+const GIT_MS = 3000;
 
-{"memories":[{"text":"one self-contained sentence","type":"decision|preference|fact|gotcha","importance":1}]}
-
-importance runs 1 (minor) to 5 (would waste an hour to rediscover). Ten memories is plenty; fewer is fine, and an empty list is a legitimate answer.`;
+/** How many rejected lines are named on the index row; the count is always exact. */
+const MAX_REJECTED_REASONS = 5;
 
 /** Whether this session reached the transcript through compact-handoff's seam. */
 const SEAM_KEY = "seam";
@@ -121,10 +137,15 @@ export const register = (on) => {
     });
 
     // A precompute is the engine building a compaction it may never use, so
-    // nothing here spends on it. It is handed on rather than declined: this
-    // plugin answers no compaction, and a `{ skip }` from here would change how
-    // the engine compacts for someone who installed a memory plugin.
+    // nothing here spends on it; the skip is recorded rather than silent, so a
+    // session whose compactions all arrive this way is visible instead of
+    // looking like a plugin that never ran. It is handed on rather than
+    // declined: this plugin answers no compaction, and a `{ skip }` from here
+    // would change how the engine compacts for someone who installed a memory
+    // plugin.
     on("session.compact", { trigger: "precompute" }, async ($, e, next) => {
+        await safely($, () => generate($, hookAbout(e), "hook"));
+
         return next(e);
     });
 
@@ -242,21 +263,31 @@ const generate = async ($, about, via) => {
         return finish($, record, "rehearsed", startedAt);
     }
 
+    // The engine speculatively compacting something it may never use. Spending
+    // a fork on a compaction that gets thrown away is money for nothing.
+    if (record.trigger === "precompute") {
+        return finish($, record, "precompute", startedAt);
+    }
+
     try {
-        const reply = await $.model.fork({ prompt: EXTRACTION_PROMPT });
+        const reply = await $.model.fork({ prompt: GENERATION_PROMPT });
 
         if (reply === null || reply === undefined) {
             return finish($, record, "cold", startedAt);
         }
 
         const text = typeof reply.text === "string" ? reply.text : "";
+        const parsed = parseReply(text);
 
         record.usage = reply.usage ?? null;
         record.replyChars = text.length;
-        record.candidates = countMemories(text);
+        record.parsedRows = parsed.rows.length;
+        record.rejectedRows = parsed.rejected.length;
+        record.rejected = parsed.rejected.slice(0, MAX_REJECTED_REASONS);
+        record.hitOutputCap = parsed.hitCap;
         record.replyFile = await safely($, () => storeReply($, record, text));
 
-        return finish($, record, text.trim() === "" ? "empty" : "extracted", startedAt);
+        return finish($, record, parsed.hadBlock ? "extracted" : "empty", startedAt, parsed.rows);
     } catch (error) {
         record.detail = String(error).slice(0, MAX_DETAIL_CHARS);
 
@@ -291,23 +322,168 @@ const blankRecord = async ($, about, via) => {
         detail: "",
         usage: null,
         replyChars: null,
-        candidates: null,
+        parsedRows: null,
+        rejectedRows: null,
+        rejected: null,
+        hitOutputCap: null,
+        memoriesWritten: null,
+        writeOutcome: null,
+        project: null,
         replyFile: null,
         elapsedMs: null,
     };
 };
 
-/** Stamps the outcome and the clock on the row, appends it, and hands it back. */
-const finish = async ($, record, outcome, startedAt) => {
+/**
+ * Stamps the outcome and the clock on the row, writes the generation to SQLite,
+ * appends the row and hands it back.
+ *
+ * The clock is read before the database write on purpose: `elapsed_ms` on a
+ * `generations` row is how long reading the conversation took, and folding a
+ * child process's startup into it would make every generation look slower than
+ * the fork it is measuring.
+ *
+ * @param {import("./parse.js").MemoryRow[]} [rows] The parsed memories, which live on the row's own
+ *   file rather than on the row: `index.jsonl` is a log, not the store.
+ */
+const finish = async ($, record, outcome, startedAt, rows = []) => {
     record.outcome = outcome;
 
     // `$.clock.now()` answers a Promise at 2.1.273 against a declaration that
     // says `number`, so every duration here is `Date.now()`.
     record.elapsedMs = Date.now() - startedAt;
 
+    const written = await safely($, () => writeGeneration($, record, rows));
+
+    record.writeOutcome = written?.outcome ?? "threw";
+    record.memoriesWritten = written?.memoriesWritten ?? null;
+    record.project = written?.project ?? null;
+
     await safely($, () => appendRow($, record));
 
     return record;
+};
+
+/**
+ * The generation, handed to SQLite by a Bun child over stdin.
+ *
+ * A plugin module runs in a sandbox with no SQLite and no import of anything
+ * but a relative file, so the database is reached the same way the row log is:
+ * a process. The whole document goes over stdin rather than the argv, because
+ * the memories are the conversation and an argv is visible in `ps`.
+ *
+ * Every failure here is a field on the row. A database that will not open must
+ * cost somebody a memory, never their compaction.
+ */
+const writeGeneration = async ($, record, rows) => {
+    const outcome = DB_OUTCOMES[record.outcome] ?? null;
+
+    if (outcome === null || record.live !== true) {
+        return { outcome: "no row", memoriesWritten: null, project: null };
+    }
+
+    const dir = await dataDir($);
+    const where = await gitFacts($, record.cwd);
+    const ran = await $.process.run(["bun", `${$.plugin.root}/schema/write-generation.js`], {
+        stdin: JSON.stringify(writeDocument(record, rows, outcome, where, `${dir}/memory.sqlite`)),
+        timeoutMs: WRITE_MS,
+    });
+    const answer = readAnswer(ran);
+
+    return {
+        outcome: answer.ok === true ? "wrote" : `refused: ${String(answer.reason ?? "").slice(0, 200)}`,
+        memoriesWritten: typeof answer.memoriesWritten === "number" ? answer.memoriesWritten : null,
+        project: typeof answer.project === "string" ? answer.project : null,
+    };
+};
+
+/** What the writer said, or the child's own failure read as the same shape. */
+const readAnswer = (ran) => {
+    try {
+        return JSON.parse((ran?.stdout ?? "").trim().split("\n").at(-1) ?? "");
+    } catch {
+        return { ok: false, reason: `the writer wrote no answer: ${(ran?.stderr ?? "").slice(0, 200)}` };
+    }
+};
+
+/** Everything the writer needs, in the one document it reads off stdin. */
+const writeDocument = (record, rows, outcome, where, dbPath) => ({
+    dbPath,
+    remoteUrl: where.remoteUrl,
+    toplevel: where.toplevel,
+    cwd: record.cwd,
+    model: record.model,
+    usage: record.usage,
+    // A pass with no usage made no model call, and a real zero says so rather
+    // than being summed into a day's total as if the fork had been free.
+    costNote: record.usage === null ? `no model call: ${record.outcome}` : null,
+    source: {
+        sessionId: record.sessionId,
+        n: record.n,
+        via: record.via,
+        trigger: record.trigger,
+        replyFile: record.replyFile,
+    },
+    rows,
+    generation: {
+        at: record.at,
+        sessionId: record.sessionId,
+        compactionN: record.n,
+        trigger: record.trigger,
+        agentId: record.agentId,
+        messagesIn: record.messagesIn,
+        outcome,
+        outcomeReason: reasonFor(record),
+        parsedRows: record.parsedRows,
+        rejectedRows: record.rejectedRows,
+        hitCap: record.hitOutputCap,
+        elapsedMs: record.elapsedMs,
+        plugin: record.plugin,
+        engine: record.engine,
+    },
+});
+
+/** Why a generation ended as it did, in the words a reader of the table wants. */
+const reasonFor = (record) => {
+    if (record.outcome === "empty") {
+        return "no block";
+    }
+
+    if (record.outcome === "cold") {
+        return "the fork found no warm main-thread transcript";
+    }
+
+    if (record.outcome === "subagent") {
+        return "a subagent's compaction is a different conversation";
+    }
+
+    if (record.outcome === "precompute") {
+        return "a precompute compaction the engine may never use";
+    }
+
+    if (record.outcome === "threw") {
+        return record.detail.slice(0, 200);
+    }
+
+    return null;
+};
+
+/**
+ * Which repository this session is in, for the project key.
+ *
+ * Both readings are allowed to fail and both are short: a compaction must never
+ * wait on a git that is slow, and a missing remote is an ordinary answer that
+ * the key falls back through.
+ */
+const gitFacts = async ($, cwd) => ({
+    remoteUrl: await gitLine($, cwd, ["git", "remote", "get-url", "origin"]),
+    toplevel: await gitLine($, cwd, ["git", "rev-parse", "--show-toplevel"]),
+});
+
+const gitLine = async ($, cwd, argv) => {
+    const ran = await safely($, () => $.process.run(argv, { cwd: cwd ?? undefined, timeoutMs: GIT_MS }));
+
+    return ran?.exitCode === 0 ? (ran.stdout ?? "").trim() || null : null;
 };
 
 /** The fork's answer as it came back, beside the row that prices it. */
@@ -322,7 +498,7 @@ const storeReply = async ($, record, text) => {
                 n: record.n,
                 via: record.via,
                 sessionId: record.sessionId,
-                prompt: EXTRACTION_PROMPT,
+                prompt: GENERATION_PROMPT,
                 text,
                 usage: record.usage,
             },
@@ -332,28 +508,6 @@ const storeReply = async ($, record, text) => {
     );
 
     return file;
-};
-
-/**
- * How many memories the fork named, or null when its answer was not the JSON
- * that was asked for. A count that cannot be read is never a zero, because a
- * zero is a real answer here.
- */
-const countMemories = (text) => {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-
-    if (start === -1 || end <= start) {
-        return null;
-    }
-
-    try {
-        const parsed = JSON.parse(text.slice(start, end + 1));
-
-        return Array.isArray(parsed?.memories) ? parsed.memories.length : null;
-    } catch {
-        return null;
-    }
 };
 
 /** What this session has done, for the tool and for a human reading the log. */

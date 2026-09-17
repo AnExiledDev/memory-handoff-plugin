@@ -127,7 +127,10 @@ describe("beside compact-handoff, the seam carries the compaction", () => {
         assert.equal(rows.length, 1);
         assert.equal(rows[0].via, "seam");
         assert.equal(rows[0].outcome, "extracted");
-        assert.equal(rows[0].candidates, 3);
+        assert.equal(rows[0].parsedRows, 3);
+        assert.equal(rows[0].rejectedRows, 0);
+        assert.equal(rows[0].memoriesWritten, 3);
+        assert.equal(rows[0].writeOutcome, "wrote");
         // The messages cannot cross the boundary, so the count is what the
         // raise carries and the fork reads the live session itself.
         assert.equal(rows[0].trigger, "auto");
@@ -268,7 +271,7 @@ describe("alone, the plugin's own session.compact hook carries it", () => {
         assert.deepEqual(answer, { passedThrough: true });
     });
 
-    it("spends nothing on a precompute and passes it through", async () => {
+    it("spends nothing on a precompute, records the skip, and passes it through", async () => {
         let forks = 0;
         const host = fakeApi({
             fork: async () => {
@@ -282,8 +285,11 @@ describe("alone, the plugin's own session.compact hook carries it", () => {
 
         const answer = await runtime.dispatch("session.compact", host.$, compactInput({ trigger: "precompute" }), next);
 
+        const rows = host.rowsIn("index.jsonl");
+
         assert.equal(forks, 0);
-        assert.equal(host.rowsIn("index.jsonl").length, 0);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].outcome, "precompute");
         assert.deepEqual(answer, { passedThrough: true });
     });
 
@@ -397,7 +403,7 @@ describe("the row a compaction leaves behind", () => {
         const stored = JSON.parse(host.files.get(row.replyFile));
 
         assert.equal(stored.via, "hook");
-        assert.match(stored.prompt, /Answer with JSON/u);
+        assert.match(stored.prompt, /Answer with a single `<memories>` block/u);
         assert.match(stored.text, /memories/u);
     });
 
@@ -414,16 +420,28 @@ describe("the row a compaction leaves behind", () => {
         );
     });
 
-    it("records a reply that is not the JSON asked for, with no count", async () => {
-        const host = fakeApi({ fork: async () => ({ text: "I would rather not.", usage: {} }) });
+    it("records prose with no block as an empty generation, and never asks again", async () => {
+        let forks = 0;
+        const host = fakeApi({
+            fork: async () => {
+                forks += 1;
+
+                return { text: "I would rather not.", usage: {} };
+            },
+        });
         const runtime = await started(host);
 
         await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());
 
         const row = host.rowsIn("index.jsonl")[0];
 
-        assert.equal(row.outcome, "extracted");
-        assert.equal(row.candidates, null);
+        // No repair call: a fork that ignored the format is one fork and one
+        // recorded miss, never a second paid attempt.
+        assert.equal(forks, 1);
+        assert.equal(row.outcome, "empty");
+        assert.equal(row.parsedRows, 0);
+        assert.equal(row.rejectedRows, 1);
+        assert.deepEqual(row.rejected, [{ line: 0, reason: "no block" }]);
         assert.equal(row.replyChars, 19);
     });
 });
