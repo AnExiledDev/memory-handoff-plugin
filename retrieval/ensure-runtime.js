@@ -12,12 +12,13 @@
  * go out, so this waits a few seconds for the weights to come up and then gives
  * up and lets retrieval degrade to FTS5-only.
  *
- * **This bounds the start and nothing else.** `/health` answers `ready: true`
- * while the ONNX sessions are still loading — it checks that a load was begun,
- * not that it finished — so a daemon can pass this and then sit on an `/embed`
- * for as long as the load takes. The call timeouts in `search.js` are the other
- * half of the bound, and the honest guarantee is the sum of the three: this
- * window, plus the embed timeout, plus the rerank timeout.
+ * **This bounds the start and nothing else.** `/health` says `ready: false`
+ * with a loading reason until both sessions exist, so the poll below really
+ * waits the load out rather than passing a daemon that is still coming up. A
+ * daemon that comes up after the window still gets a call, though, so the call
+ * timeouts in `search.js` are the other half of the bound and the honest
+ * guarantee is the sum of the three: this window, plus the embed timeout, plus
+ * the rerank timeout.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
