@@ -146,6 +146,9 @@ const document = (answer, flags) => ({
 });
 
 /** `--flag value` and `--flag` (true). A value that begins with `--` is the next flag, not this one's argument. */
+/** The flags that take no value, so a bare token after one is never swallowed as its value. */
+const SWITCHES = new Set(["query-stdin", "no-runtime", "with-id"]);
+
 const parseFlags = (argv) => {
     /** @type {Record<string, any>} */
     const flags = {};
@@ -158,7 +161,7 @@ const parseFlags = (argv) => {
         const name = token.slice(2);
         const next = argv[index + 1];
 
-        if (next === undefined || next.startsWith("--")) {
+        if (SWITCHES.has(name) || next === undefined || next.startsWith("--")) {
             flags[name] = true;
             continue;
         }
