@@ -1,13 +1,14 @@
 /**
  * memory-handoff: the conversation a compaction throws away, read once for
- * anything worth remembering later.
+ * anything worth remembering later, and handed back at the next prompt.
  *
- * This is the skeleton. It forks the session at compaction time, asks the fork
- * a placeholder extraction question, and writes what came back plus what it
- * cost. Nothing is stored in SQLite, nothing is retrieved and nothing is
- * injected yet; that is AnExiledDev/claude-investigations #680 to #683.
+ * It forks the session at compaction time, asks the fork for what is worth
+ * keeping, and writes the memories and what they cost to SQLite. At the next
+ * prompt somebody types it retrieves against that store and attaches what it
+ * found as context the model reads and the person never sees. Four tools and a
+ * pane are how a person sees it instead.
  *
- * Two rules shape everything below.
+ * Four rules shape everything below.
  *
  * **Exactly one fork per compaction.** compact-handoff answers `session.compact`
  * without calling `next`, so a plugin keyed after it in `enabledPlugins` never
@@ -25,9 +26,25 @@
  * you still get. Every runtime call is wrapped: a throw becomes a field on the
  * row and never an unhandled rejection, because the worst case of installing
  * this must be your own compaction plus a row.
+ *
+ * **It never answers a prompt either.** Every `prompt.submit` dispatch ends in
+ * `next`, and the context is attached on the way down, which is the only place
+ * the engine attaches it. A retrieval is bounded by a hard timeout on the whole
+ * child; when it does not answer, the prompt goes down untouched and a row says
+ * why. The worst case of a broken memory store is a prompt with no memories.
+ *
+ * **Nothing here can open SQLite.** A plugin module runs in a sandbox that
+ * imports its own files and `claude-code` and nothing else, so every database
+ * call below is a Bun child: `retrieval/search-cli.js` for a retrieval,
+ * `retrieval/explain-cli.js` for a trace, `schema/write-generation.js` for a
+ * generation and `schema/memory-admin.js` for everything else.
  */
 
+import { projectKey } from "../schema/generation-rows.js";
+import { composeInjection, finalScoreOf, injectionGate, promptLine } from "./inject.js";
+import { paneTree } from "./pane.js";
 import { parseReply } from "./parse.js";
+import { priceUsage } from "./pricing.js";
 import { GENERATION_PROMPT } from "./prompt.js";
 
 /**
@@ -49,6 +66,7 @@ const DB_OUTCOMES = {
     threw: "failed",
     subagent: "skipped",
     precompute: "skipped",
+    overBudget: "overBudget",
 };
 
 /** How long the writer child may take before the generation is recorded without it. */
@@ -90,24 +108,177 @@ const DEPTH_KEY = "depth";
 /** How much of a fork's reply is kept on the row itself; the rest is on disk. */
 const MAX_DETAIL_CHARS = 2000;
 
+/** How long a tool's child may take. Nobody is waiting on a keystroke here. */
+const TOOL_MS = 30_000;
+
+/** The four tools the model may call, spelled out because a matcher takes a literal. */
+const TOOL_SEARCH = "mcp__memory-handoff__memory_search";
+const TOOL_EXPLAIN = "mcp__memory-handoff__memory_explain";
+const TOOL_LIST = "mcp__memory-handoff__memory_list";
+const TOOL_DELETE = "mcp__memory-handoff__memory_delete";
+
+/** What every knob is when nobody set it. */
+const DEFAULT_INJECT_K = 5;
+const DEFAULT_MAX_ENTRIES = 5;
+const DEFAULT_MAX_CHARS = 4000;
+const DEFAULT_INJECT_MS = 2500;
+const DEFAULT_BUDGET_USD = 1;
+
+/**
+ * How much of the prompt's own budget the child's runtime wait may take.
+ *
+ * The outer `timeoutMs` is the hard bound on the whole child; the runtime wait
+ * inside it has to end first, or the child is killed mid-degradation and the
+ * `retrievals` row it was about to write is never written. Measured on
+ * 2026-09-17 against a cold daemon: the bun child itself costs ~330 ms before
+ * the wait starts, and a cold embed plus the rerank and the row is ~450 ms
+ * after it ends, so the margin covers that and the whole child fits inside
+ * `DEFAULT_INJECT_MS` (1650 ms cold, ~430 ms warm).
+ */
+const RUNTIME_MARGIN_MS = 700;
+
+/** The least runtime wait worth asking for once the margin is taken off. */
+const RUNTIME_FLOOR_MS = 200;
+
+/** The pane's id and its tab. One pane, opened once. */
+const PANE_ID = "memory-handoff";
+const PANE_TITLE = "Memories";
+
+/** How many prompts the pane lists before the oldest falls off. */
+const MAX_PANE_INJECTIONS = 20;
+
+/**
+ * Everything that belongs to this session and nothing else.
+ *
+ * `$.store` is the plugin's one JSON file under the configuration directory,
+ * kept between sessions and shared by every session running at once, so
+ * anything "for this session" written there is read back by the next session
+ * and the one beside it: the pane opened once and never again, the budget
+ * summed across a week, another directory's project key. Measured live on
+ * 2026-09-17 (the pane never appeared after the first session). Process memory
+ * is per session by construction; it is reset on `session.start` for the hot
+ * reload that keeps the process, and the store keeps only the seam reading,
+ * which is the one fact worth keeping across sessions.
+ */
+const freshSession = () => ({
+    /** What this session has injected, for the pane. Newest first. */
+    injections: [],
+    /** This session's running counts, for `memory_status` and the budget. */
+    counts: {},
+    /** Whether the pane was opened, and whether the person closed it. */
+    pane: { opened: false, closedByPerson: false },
+    /** The project key, worked out once from git. `null` until it is. */
+    project: null,
+});
+
+let session = freshSession();
+
+/** The counters a session starts with. */
+const EMPTY_SESSION = {
+    retrievals: 0,
+    injections: 0,
+    memoriesInjected: 0,
+    charsInjected: 0,
+    approxTokensInjected: 0,
+    spendUsd: 0,
+};
+
+/** What a tool answers when its own body threw; a tool never throws at the model. */
+const THREW = { ok: false, reason: "memory-handoff: the call threw, and the reason is in the session's debug log" };
+
 /**
  * Three environment variables steer this, and the static scan will only take
  * them spelled out at the call site, so they are named here and nowhere else:
  *
- * - `MEMORY_HANDOFF_LIVE` off, it rehearses: it writes a row saying what it
- *   would have done and spends nothing.
- * - `MEMORY_HANDOFF_DIR` where the rows and replies are kept.
+ * - `MEMORY_HANDOFF_LIVE` off, it rehearses: a generation writes a row saying
+ *   what it would have done and spends nothing, and a prompt still runs its
+ *   retrieval and writes its row but attaches nothing to the prompt.
+ * - `MEMORY_HANDOFF_DIR` where the rows, the replies and the database are kept.
+ * - `MEMORY_HANDOFF_INJECT_K` how many memories a prompt's retrieval asks for.
+ * - `MEMORY_HANDOFF_INJECT_MAX_ENTRIES` how many of them may be attached.
+ * - `MEMORY_HANDOFF_INJECT_MAX_CHARS` how much text they may come to.
+ * - `MEMORY_HANDOFF_INJECT_TIMEOUT_MS` the hard bound on the retrieval child.
+ * - `MEMORY_HANDOFF_SESSION_BUDGET_USD` what one session's generations may cost
+ *   before the next one is skipped.
  */
 export const register = (on) => {
     on("session.start", async ($, e, next) => {
+        session = freshSession();
+
         await safely($, () => registerTools($));
         await safely($, () => subscribeToSeam($));
 
         return next(e);
     });
 
+    /**
+     * The prompt, and the memories that go down with it.
+     *
+     * The retrieval runs before `next` because context attaches on the way
+     * down: the declaration is explicit that context put on the result after
+     * `next` resolved is not attached, the prompt having already entered. The
+     * row, the pane and the counters all wait until after, so the only thing
+     * between the person's Enter and their turn is the one bounded child.
+     */
+    on("prompt.submit", async ($, e, next) => {
+        const plan = await safely($, () => planInjection($, e));
+
+        if (plan === null) {
+            return next(e);
+        }
+
+        const answer = await next(plan.block === null ? e : { ...e, context: [...(e.context ?? []), plan.block] });
+
+        await safely($, () => recordInjection($, plan));
+        await safely($, () => showPane($));
+
+        return answer;
+    });
+
+    on("ui.render", { surface: "terminal", component: "Pane" }, async ($, e, next) => {
+        if (e.requestId !== PANE_ID) {
+            return next(e);
+        }
+
+        return drawMemoryPane($, e);
+    });
+
+    /**
+     * A pane the person closed stays closed.
+     *
+     * Reopening it on the next injection is the behaviour that makes a person
+     * uninstall a plugin, so the close is remembered for the session and the
+     * only way back is `/memory` in a later version, or a new session.
+     */
+    on("ui.close", async ($, e, next) => {
+        if (e.id === PANE_ID && e.origin?.kind === "person") {
+            session.pane = { opened: false, closedByPerson: true };
+        }
+
+        return next(e);
+    });
+
     on("tool.call", { tool: "mcp__memory-handoff__memory_status" }, async ($) => {
         return { result: JSON.stringify(await statusReport($), null, 2) };
+    });
+
+    // A hook apiece rather than one dispatcher: the engine refuses a module
+    // that hands `$` to anything but a top-level function of this file, so
+    // every tool names the function that serves it.
+    on("tool.call", { tool: TOOL_SEARCH }, async ($, e) => {
+        return { result: JSON.stringify((await safely($, () => searchTool($, e))) ?? THREW, null, 2) };
+    });
+
+    on("tool.call", { tool: TOOL_EXPLAIN }, async ($, e) => {
+        return { result: JSON.stringify((await safely($, () => explainTool($, e))) ?? THREW, null, 2) };
+    });
+
+    on("tool.call", { tool: TOOL_LIST }, async ($, e) => {
+        return { result: JSON.stringify((await safely($, () => listTool($, e))) ?? THREW, null, 2) };
+    });
+
+    on("tool.call", { tool: TOOL_DELETE }, async ($, e) => {
+        return { result: JSON.stringify((await safely($, () => deleteTool($, e))) ?? THREW, null, 2) };
     });
 
     // compact-handoff raising the seam, one compaction before it happens. It
@@ -266,6 +437,18 @@ const generate = async ($, about, via) => {
         return finish($, record, "precompute", startedAt);
     }
 
+    // A session that compacts all day is a session that forks all day. The
+    // ceiling is per session rather than per day because a session is what a
+    // person is looking at when they decide this plugin costs too much.
+    const budget = await sessionBudget($);
+    const spent = (await sessionCounts($)).spendUsd;
+
+    if (budget !== null && spent >= budget) {
+        record.detail = `${spent.toFixed(4)} spent of a ${budget.toFixed(2)} session ceiling`;
+
+        return finish($, record, "overBudget", startedAt);
+    }
+
     try {
         const reply = await $.model.fork({ prompt: GENERATION_PROMPT });
 
@@ -278,6 +461,10 @@ const generate = async ($, about, via) => {
 
         record.usage = reply.usage ?? null;
         record.replyChars = text.length;
+        // Priced here and not only in the writer, because the ceiling above has
+        // to hold in the session that is spending, not in the next one that
+        // reads the table.
+        await safely($, () => bumpSession($, { spendUsd: priceUsage(record.usage, record.model).usd ?? 0 }));
         record.parsedRows = parsed.rows.length;
         record.rejectedRows = parsed.rejected.length;
         record.rejected = parsed.rejected.slice(0, MAX_REJECTED_REASONS);
@@ -420,6 +607,10 @@ const writeDocument = (record, rows, outcome, where, dbPath) => ({
         trigger: record.trigger,
         replyFile: record.replyFile,
     },
+    // The vectors are written behind the compaction, by a child the writer
+    // starts and does not wait for: a memory without one is found by FTS5
+    // alone until the runtime has embedded it.
+    embedAfter: true,
     rows,
     generation: {
         at: record.at,
@@ -455,6 +646,10 @@ const reasonFor = (record) => {
 
     if (record.outcome === "precompute") {
         return "a precompute compaction the engine may never use";
+    }
+
+    if (record.outcome === "overBudget") {
+        return `the session's generation budget is spent: ${record.detail}`;
     }
 
     if (record.outcome === "threw") {
@@ -506,16 +701,456 @@ const storeReply = async ($, record, text) => {
     return file;
 };
 
-/** What this session has done, for the tool and for a human reading the log. */
+/**
+ * One prompt's whole injection decision, made before the prompt goes down.
+ *
+ * `null` means this submission is not one memories go to at all, and that is
+ * the one path that writes no row: a peer session's delivery, a plugin's own
+ * prompt or an empty one is not a retrieval that failed, it is a retrieval that
+ * was never owed. Every other path returns a plan, and every plan becomes a row.
+ *
+ * @returns {Promise<object | null>}
+ */
+const planInjection = async ($, e) => {
+    const gate = injectionGate(e);
+
+    if (gate.inject !== true) {
+        return null;
+    }
+
+    const plan = {
+        query: gate.query,
+        caps: await injectCaps($),
+        sessionId: await safely($, () => $.session.id()),
+        turnId: null,
+        project: await projectFor($),
+        retrievalId: null,
+        candidates: 0,
+        chosen: [],
+        block: null,
+        chars: 0,
+        approxTokens: 0,
+        dropped: 0,
+        disposition: "injected",
+        reason: null,
+        msTotal: null,
+    };
+
+    if (plan.project === null) {
+        return failedPlan(plan, "no project key: this session has neither a git remote, a toplevel nor a cwd");
+    }
+
+    const startedAt = Date.now();
+    const found = await searchForPrompt($, plan);
+
+    plan.msTotal = Date.now() - startedAt;
+
+    if (found.ok !== true) {
+        return failedPlan(plan, found.reason);
+    }
+
+    const results = Array.isArray(found.document.results) ? found.document.results : [];
+    const composed = composeInjection(results, plan.caps, found.document.retrievalId ?? "?");
+
+    plan.retrievalId = typeof found.document.retrievalId === "number" ? found.document.retrievalId : null;
+    plan.candidates = results.length;
+    plan.chosen = composed.entries.map(paneEntry);
+    plan.dropped = composed.dropped;
+    plan.block = composed.block;
+    plan.chars = composed.chars;
+    plan.approxTokens = composed.approxTokens;
+
+    if ((await isLive($)) !== true) {
+        return rehearsedPlan(plan);
+    }
+
+    return plan;
+};
+
+/** A plan that never reached a retrieval, or reached one that did not answer. */
+const failedPlan = (plan, reason) => ({ ...plan, disposition: "failed", reason, block: null, chars: 0, approxTokens: 0 });
+
+/**
+ * A plan that ran, chose, and attached nothing.
+ *
+ * The schema has no disposition column and this issue adds no DDL, so the pair
+ * of rows carries it: the `retrievals` row is whole (it really ran, and
+ * `returned_n` says what it found) while the `injections` row beside it holds
+ * no ids and no characters. A failed retrieval reads differently because its
+ * own row is the degraded one. Both are in the README.
+ */
+const rehearsedPlan = (plan) => ({
+    ...plan,
+    disposition: "rehearsed",
+    reason: "MEMORY_HANDOFF_LIVE is off, so nothing was attached",
+    block: null,
+    chars: 0,
+    approxTokens: 0,
+    dropped: plan.candidates,
+});
+
+/** What the pane and the row keep about one chosen memory. */
+const paneEntry = (entry) => {
+    const scored = finalScoreOf(entry);
+
+    return { memoryId: entry.memoryId, title: entry.title, score: scored.score, scoreKind: scored.kind };
+};
+
+/**
+ * The retrieval, as a bounded child.
+ *
+ * Bounded twice: `timeoutMs` is the hard stop on the whole child and the only
+ * thing standing between a wedged runtime and the person's Enter, and the
+ * runtime wait inside it is set lower so the child still has time to write its
+ * own degraded row before it is killed. `$.process.run` rejects on the timeout
+ * rather than resolving with a code, which is why the call is wrapped.
+ *
+ * The query goes over stdin, never the argv: the query here is the prompt the
+ * person typed, and an argv is readable in `ps` by anyone on the machine.
+ */
+const searchForPrompt = async ($, plan) => {
+    const runtimeMs = Math.max(RUNTIME_FLOOR_MS, plan.caps.timeoutMs - RUNTIME_MARGIN_MS);
+    const argv = [
+        "bun",
+        `${$.plugin.root}/retrieval/search-cli.js`,
+        await dbFile($),
+        "--project",
+        plan.project,
+        "--query-stdin",
+        "--k",
+        String(plan.caps.k),
+        "--origin",
+        "prompt",
+        "--runtime-timeout-ms",
+        String(runtimeMs),
+        "--with-id",
+        ...(typeof plan.sessionId === "string" && plan.sessionId !== "" ? ["--session-id", plan.sessionId] : []),
+    ];
+
+    let ran = null;
+
+    try {
+        ran = await $.process.run(argv, { timeoutMs: plan.caps.timeoutMs, stdin: plan.query });
+    } catch (error) {
+        return { ok: false, reason: `the retrieval did not finish inside ${plan.caps.timeoutMs}ms: ${String(error).slice(0, 200)}` };
+    }
+
+    if (ran?.exitCode !== 0) {
+        return { ok: false, reason: `the retrieval exited ${ran?.exitCode ?? "(no code)"}: ${(ran?.stderr ?? "").trim().slice(0, 200)}` };
+    }
+
+    try {
+        return { ok: true, document: JSON.parse(ran.stdout ?? "") };
+    } catch (error) {
+        return { ok: false, reason: `the retrieval printed no document: ${String(error).slice(0, 200)}` };
+    }
+};
+
+/**
+ * The row, the pane's copy and the counters, after the prompt has entered.
+ *
+ * The row goes first: what the model was given is the fact worth keeping, and
+ * the pane is a view of it.
+ */
+const recordInjection = async ($, plan) => {
+    const injected = plan.disposition === "injected";
+    const written = await adminCall($, "injection", {
+        sessionId: plan.sessionId,
+        turnId: plan.turnId,
+        retrievalId: plan.retrievalId,
+        memoryIds: injected ? plan.chosen.map((entry) => entry.memoryId) : [],
+        chars: plan.chars,
+        approxTokens: plan.approxTokens,
+        capChars: plan.caps.maxChars,
+        capEntries: plan.caps.maxEntries,
+        dropped: plan.dropped,
+        // Nothing is ever cut mid-body, so this column is always zero here; it
+        // is written rather than left out so the row says so.
+        clippedChars: 0,
+        ...(plan.retrievalId === null
+            ? {
+                  failure: {
+                      query: plan.query,
+                      reason: plan.reason ?? "the retrieval did not answer",
+                      project: plan.project,
+                      origin: "prompt",
+                      k: plan.caps.k,
+                      msTotal: plan.msTotal,
+                  },
+              }
+            : {}),
+    });
+
+    await rememberInjection($, plan);
+    await bumpSession($, {
+        retrievals: plan.retrievalId === null ? 0 : 1,
+        injections: 1,
+        memoriesInjected: injected ? plan.chosen.length : 0,
+        charsInjected: plan.chars,
+        approxTokensInjected: plan.approxTokens,
+    });
+
+    return written;
+};
+
+/** The pane's list: newest first, and short, because it is a view and not the log. */
+const rememberInjection = async ($, plan) => {
+    const entry = {
+        at: new Date().toISOString(),
+        prompt: promptLine(plan.query),
+        retrievalId: plan.retrievalId,
+        entries: plan.chosen,
+        chars: plan.chars,
+        approxTokens: plan.approxTokens,
+        dropped: plan.dropped,
+        disposition: plan.disposition,
+        reason: plan.reason,
+    };
+
+    session.injections = [entry, ...session.injections].slice(0, MAX_PANE_INJECTIONS);
+};
+
+/**
+ * Opens the pane the first time something is injected, and only then.
+ *
+ * Not at `session.start`: a pane that opens before there is anything in it is a
+ * plugin taking a third of somebody's terminal to say nothing. Not again after
+ * the person closed it, for the same reason in reverse.
+ *
+ * The open is allowed to fail — headless has no surface, and a narrow terminal
+ * holds the open undrawn — and a failure is logged rather than swallowed,
+ * because "the pane never appeared" is otherwise unanswerable.
+ */
+const showPane = async ($) => {
+    if (session.pane.closedByPerson === true) {
+        return;
+    }
+
+    if (session.pane.opened !== true) {
+        try {
+            await $.ui.open({ id: PANE_ID, title: PANE_TITLE });
+            session.pane = { opened: true, closedByPerson: false };
+        } catch (error) {
+            await safely($, () => $.ui.log(`memory-handoff: the pane would not open: ${String(error).slice(0, 200)}`));
+
+            return;
+        }
+    }
+
+    await safely($, () => $.ui.invalidate("ui.render"));
+};
+
+/** This session's injections, drawn. The tree itself is `hooks/pane.js`. */
+const drawMemoryPane = async ($, e) => {
+    const elements = $.ui.resolve(e);
+    const view = {
+        live: await isLive($),
+        dbPath: await dbFile($),
+        injections: session.injections,
+    };
+
+    return paneTree(elements, view, e.props?.bodyColumns ?? e.viewport?.columns);
+};
+
+/* ------------------------------------------------------------------- tools */
+
+/**
+ * A retrieval the model asked for, traced as `tool` rather than `prompt`.
+ *
+ * The query goes over stdin for the same reason the prompt's does: a search the
+ * model ran on somebody's words has no business in `ps`.
+ */
+const searchTool = async ($, e) => {
+    const project = await projectFor($);
+
+    if (project === null) {
+        return { ok: false, reason: "no project key: this session has neither a git remote, a toplevel nor a cwd" };
+    }
+
+    const query = typeof e?.query === "string" ? e.query.trim() : "";
+
+    if (query === "") {
+        return { ok: false, reason: "memory_search needs a query" };
+    }
+
+    const caps = await injectCaps($);
+    const argv = [
+        "bun",
+        `${$.plugin.root}/retrieval/search-cli.js`,
+        await dbFile($),
+        "--project",
+        project,
+        "--query-stdin",
+        "--k",
+        String(wholeNumber(e?.k, caps.k)),
+        "--origin",
+        "tool",
+        "--with-id",
+        ...(typeof e?.types === "string" && e.types.trim() !== "" ? ["--types", e.types.trim()] : []),
+        ...(Array.isArray(e?.types) && e.types.length > 0 ? ["--types", e.types.join(",")] : []),
+    ];
+    const ran = await $.process.run(argv, { timeoutMs: TOOL_MS, stdin: query });
+
+    if (ran?.exitCode !== 0) {
+        return { ok: false, reason: `the retrieval exited ${ran?.exitCode ?? "(no code)"}: ${(ran?.stderr ?? "").trim().slice(0, 500)}` };
+    }
+
+    try {
+        return { ok: true, ...JSON.parse(ran.stdout ?? "") };
+    } catch (error) {
+        return { ok: false, reason: `the retrieval printed no document: ${String(error).slice(0, 200)}` };
+    }
+};
+
+/** One retrieval's trace, read back from the tables it was written to. */
+const explainTool = async ($, e) => {
+    const retrievalId = wholeNumber(e?.retrievalId, 0);
+
+    if (retrievalId < 1) {
+        return { ok: false, reason: `${JSON.stringify(e?.retrievalId ?? null)} is not a retrieval id` };
+    }
+
+    const argv = ["bun", `${$.plugin.root}/retrieval/explain-cli.js`, await dbFile($), String(retrievalId), "--json"];
+    const ran = await $.process.run(argv, { timeoutMs: TOOL_MS });
+
+    if (ran?.exitCode !== 0) {
+        return { ok: false, reason: `no trace for retrieval ${retrievalId}: ${(ran?.stderr ?? "").trim().slice(0, 500)}` };
+    }
+
+    // `--json` prints a formatted document over many lines, so the whole of
+    // stdout is the answer here rather than its last line.
+    try {
+        return { ok: true, ...JSON.parse(ran.stdout ?? "") };
+    } catch (error) {
+        return { ok: false, reason: `the trace printed no document: ${String(error).slice(0, 200)}` };
+    }
+};
+
+/** This project's memories, newest first. */
+const listTool = async ($, e) =>
+    adminCall($, "list", {
+        project: await projectFor($),
+        limit: e?.limit,
+        offset: e?.offset,
+        status: e?.status,
+    });
+
+/** A memory the person disagrees with: tombstoned, or purged when asked. */
+const deleteTool = async ($, e) => adminCall($, "delete", { id: e?.id, purge: e?.purge === true });
+
+/** Every call into `schema/memory-admin.js`, which is every database call but a retrieval. */
+const adminCall = async ($, op, doc) => {
+    const ran = await $.process.run(["bun", `${$.plugin.root}/schema/memory-admin.js`, await dbFile($), op], {
+        stdin: JSON.stringify(doc),
+        timeoutMs: TOOL_MS,
+    });
+
+    return readAnswer(ran);
+};
+
+/* ----------------------------------------------------------------- session */
+
+/**
+ * The project key, worked out once and kept.
+ *
+ * The same `projectKey` the generation path writes with, from the same two git
+ * readings, because a retrieval filtered on a key no generation ever wrote is a
+ * retrieval that silently returns nothing.
+ */
+const projectFor = async ($) => {
+    if (session.project !== null) {
+        return session.project.project;
+    }
+
+    const cwd = await safely($, () => $.session.cwd());
+    const where = await gitFacts($, cwd);
+
+    session.project = projectKey(where.remoteUrl, where.toplevel, cwd);
+
+    return session.project.project;
+};
+
+/** This session's running counts. */
+const sessionCounts = async () => ({ ...EMPTY_SESSION, ...session.counts });
+
+/** Adds to this session's counts. Every field is a total, so every write is a sum. */
+const bumpSession = async ($, patch) => {
+    const after = await sessionCounts($);
+
+    for (const [key, value] of Object.entries(patch)) {
+        after[key] = (after[key] ?? 0) + (Number.isFinite(value) ? value : 0);
+    }
+
+    session.counts = after;
+
+    return after;
+};
+
+/** Where the database is. One spelling, because a second one is a second database. */
+const dbFile = async ($) => `${await dataDir($)}/memory.sqlite`;
+
+/**
+ * The four injection knobs.
+ *
+ * Read at every prompt rather than once, so changing one in the environment of
+ * a long session is not a restart.
+ */
+const injectCaps = async ($) => ({
+    k: wholeNumber(await $.env.get("MEMORY_HANDOFF_INJECT_K"), DEFAULT_INJECT_K),
+    maxEntries: wholeNumber(await $.env.get("MEMORY_HANDOFF_INJECT_MAX_ENTRIES"), DEFAULT_MAX_ENTRIES),
+    maxChars: wholeNumber(await $.env.get("MEMORY_HANDOFF_INJECT_MAX_CHARS"), DEFAULT_MAX_CHARS),
+    timeoutMs: wholeNumber(await $.env.get("MEMORY_HANDOFF_INJECT_TIMEOUT_MS"), DEFAULT_INJECT_MS),
+});
+
+/** What this session's generations may cost. Zero or less is no ceiling at all. */
+const sessionBudget = async ($) => {
+    const raw = Number.parseFloat(((await $.env.get("MEMORY_HANDOFF_SESSION_BUDGET_USD")) ?? "").trim());
+    const budget = Number.isFinite(raw) ? raw : DEFAULT_BUDGET_USD;
+
+    return budget > 0 ? budget : null;
+};
+
+const wholeNumber = (value, fallback) => {
+    const parsed = Number.parseInt(String(value ?? "").trim(), 10);
+
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+/**
+ * What this session has done, what the store holds, and what it has cost.
+ *
+ * The spend comes back in three numbers rather than one: what was priced, what
+ * the subscription waives, and how many rows carry no price at all. Folding an
+ * unpriced row in as zero is the one thing the `costs` table's own CHECK exists
+ * to stop, and a status line that undoes it is worse than no line.
+ */
 const statusReport = async ($) => {
     const rows = await readRows($);
     const seam = await safely($, () => $.store.get(SEAM_KEY));
+    const sessionId = await safely($, () => $.session.id());
+    const mine = rows.filter((row) => row.sessionId === sessionId);
+    const counts = await sessionCounts($);
 
     return {
         live: await isLive($),
         dir: await dataDir($),
+        dbPath: await dbFile($),
+        project: await projectFor($),
         seam: seam ?? null,
         rows: rows.length,
+        session: {
+            id: sessionId ?? null,
+            generations: mine.length,
+            memoriesWritten: mine.reduce((sum, row) => sum + (row.memoriesWritten ?? 0), 0),
+            retrievals: counts.retrievals,
+            injections: counts.injections,
+            memoriesInjected: counts.memoriesInjected,
+            charsInjected: counts.charsInjected,
+            approxTokensInjected: counts.approxTokensInjected,
+            spendUsd: counts.spendUsd,
+            budgetUsd: await sessionBudget($),
+        },
+        database: (await safely($, () => adminCall($, "counts", {}))) ?? null,
         last: rows.at(-1) ?? null,
     };
 };
@@ -587,10 +1222,78 @@ const registerTools = async ($) => {
     await $.tool.register({
         name: "memory_status",
         description:
-            "What memory-handoff has done: whether it is live, where its data lives, whether it is reading " +
-            "compactions through compact-handoff's seam or through its own hook, how many generations have " +
-            "been recorded, and the whole of the most recent row.",
+            "What memory-handoff has done: whether it is live, where its database is, whether it is reading " +
+            "compactions through compact-handoff's seam or through its own hook, what this session has " +
+            "written, retrieved, injected and spent, and what the whole store holds.",
         inputSchema: { type: "object", properties: {} },
+    });
+
+    await $.tool.register({
+        name: "memory_search",
+        description:
+            "Search this project's memories from earlier sessions. Use it when the person refers to something " +
+            "decided or discovered before this conversation, or when you want what was already learned about a " +
+            "file or a decision. Answers the matching memories with their scores and the id of the trace that " +
+            "explains the ranking.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                query: { type: "string", description: "What to look for, in the person's own words where possible." },
+                k: { type: "number", description: "How many memories to return. Five by default." },
+                types: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Narrow to memory types: user, feedback, project, reference.",
+                },
+            },
+            required: ["query"],
+        },
+    });
+
+    await $.tool.register({
+        name: "memory_explain",
+        description:
+            "Why one retrieval ranked what it did: its filters, every candidate, and the score each stage gave " +
+            "it. Takes the retrieval id that memory_search and the injected memory block carry.",
+        inputSchema: {
+            type: "object",
+            properties: { retrievalId: { type: "number", description: "The id off a search or an injected block." } },
+            required: ["retrievalId"],
+        },
+    });
+
+    await $.tool.register({
+        name: "memory_list",
+        description:
+            "This project's memories, newest first, whether or not they match anything. For reviewing what has " +
+            "been remembered; memory_search is what to use when looking for something.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                limit: { type: "number", description: "How many to return. Twenty by default, a hundred at most." },
+                offset: { type: "number", description: "How many to skip, for the next page." },
+                status: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Which statuses to include: active (the default), deleted.",
+                },
+            },
+        },
+    });
+
+    await $.tool.register({
+        name: "memory_delete",
+        description:
+            "Remove a memory the person disagrees with. It is tombstoned by default, which stops it being " +
+            "retrieved while keeping the record that it was written; purge deletes the text outright.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "The memory's id, as memory_search and memory_list give it." },
+                purge: { type: "boolean", description: "Delete the row rather than tombstone it." },
+            },
+            required: ["id"],
+        },
     });
 };
 

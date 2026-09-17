@@ -173,6 +173,133 @@ export const fakeSeam = (version = "0.6.0") => {
     };
 };
 
+/** The event a person's Enter carries, as `prompt.submit` stamps it. */
+export const promptInput = (extra = {}) => ({
+    text: "why did the cron job stop",
+    wait: false,
+    origin: { kind: "composer" },
+    ...extra,
+});
+
+/** What a retrieval answers when the database has something to say. */
+export const searchDocument = (results = 2, extra = {}) => ({
+    retrievalId: 7,
+    degraded: null,
+    matchExpression: '"cron" OR "stop"',
+    results: Array.from({ length: results }, (_, index) => ({
+        rank: index + 1,
+        memoryId: index + 1,
+        title: `memory ${index + 1}`,
+        body: `the ${index + 1}th thing an earlier session established`,
+        type: "project",
+        importance: 3,
+        scores: { fts: -0.8, vector: null, merge: 0.016, rerank: 2.25 - index },
+    })),
+    ...extra,
+});
+
+/** Which child a call to `$.process.run` is, by the script at the end of its argv. */
+const childKind = (argv) => {
+    const script = String(argv?.[1] ?? "");
+
+    if (script.endsWith("search-cli.js")) return "search";
+    if (script.endsWith("explain-cli.js")) return "explain";
+    if (script.endsWith("memory-admin.js")) return "admin";
+
+    return null;
+};
+
+/**
+ * The three Bun children the injection path shells, answered as they answer.
+ *
+ * An override may be a function, which is how a test makes one of them time out
+ * (`$.process.run` rejects on `timeoutMs`, so the fake throws) or exit non-zero.
+ */
+const childAnswer = async (kind, argv, options, overrides) => {
+    const override = overrides[kind];
+
+    if (typeof override === "function") {
+        return override(argv, options);
+    }
+
+    if (kind === "search") {
+        return { exitCode: 0, stdout: `${JSON.stringify(override ?? searchDocument())}\n`, stderr: "retrieval 7\n" };
+    }
+
+    if (kind === "explain") {
+        return {
+            exitCode: 0,
+            stdout: `${JSON.stringify(override ?? { retrieval: { id: 7, origin: "tool" }, candidates: [] }, null, 2)}\n`,
+            stderr: "",
+        };
+    }
+
+    return { exitCode: 0, stdout: `${JSON.stringify(override ?? adminAnswer(argv, options))}\n`, stderr: "" };
+};
+
+/** `schema/memory-admin.js`, answering each op as it does. */
+const adminAnswer = (argv, options) => {
+    const op = String(argv.at(-1));
+    const doc = JSON.parse(options.stdin ?? "{}");
+
+    if (op === "injection") {
+        return { ok: true, injectionId: 1, retrievalId: doc.retrievalId ?? 1 };
+    }
+
+    if (op === "counts") {
+        return {
+            ok: true,
+            memories: { total: 3, active: 3, deleted: 0 },
+            projects: 1,
+            generations: 1,
+            retrievals: 1,
+            injections: 1,
+            spend: { rows: 1, usd: 0.0123, cacheReadWaivedUsd: 0.4, unpricedRows: 1 },
+        };
+    }
+
+    if (op === "list") {
+        return { ok: true, total: 1, limit: doc.limit ?? 20, offset: 0, status: ["active"], memories: [] };
+    }
+
+    return { ok: true, id: doc.id, mode: doc.purge === true ? "purged" : "tombstoned", title: "a memory", wasStatus: "active" };
+};
+
+/**
+ * The terminal's element table, as `$.ui.resolve(e)` hands it over.
+ *
+ * Every factory records what it drew, so a test can walk the tree and see which
+ * elements were used and how wide each line came out. `div`, `span` and `b`
+ * stopped being elements at 2.1.267 and are deliberately absent: a module still
+ * reaching for one fails here the way it fails in the engine.
+ */
+export const elementTable = () =>
+    Object.fromEntries(
+        ["Box", "Text", "Code", "Button", "Link", "Input", "Select"].map((name) => [
+            name,
+            (props = {}) => ({ element: name, props }),
+        ]),
+    );
+
+/** Every node of a drawn tree, depth first. */
+export const paneNodes = (node) => {
+    if (Array.isArray(node)) {
+        return node.flatMap((child) => paneNodes(child));
+    }
+
+    if (node === null || typeof node !== "object" || typeof node.element !== "string") {
+        return [];
+    }
+
+    return [node, ...paneNodes(node.props?.children ?? [])];
+};
+
+/** Every line of text a tree draws, in order. */
+export const paneLines = (tree) =>
+    paneNodes(tree)
+        .filter((node) => node.element === "Text")
+        .map((node) => String(node.props.children ?? ""));
+
 /**
  * The `$` a hook is handed.
  *
@@ -187,6 +314,12 @@ export const fakeApi = (overrides = {}) => {
     const appends = [];
     const writes = [];
     const tools = [];
+    const children = [];
+    const opens = [];
+    const closes = [];
+    const invalidations = [];
+    const logs = [];
+    const elements = elementTable();
 
     files.set("/plugin/.claude-plugin/plugin.json", JSON.stringify({ version: "0.1.0-test" }));
 
@@ -223,6 +356,14 @@ export const fakeApi = (overrides = {}) => {
                     return writerAnswer(writes, options.stdin ?? "", overrides.write);
                 }
 
+                const kind = childKind(argv);
+
+                if (kind !== null) {
+                    children.push({ kind, argv, stdin: options.stdin ?? null, timeoutMs: options.timeoutMs ?? null });
+
+                    return childAnswer(kind, argv, options, overrides);
+                }
+
                 appends.push({ file: argv.at(-1), line: (options.stdin ?? "").trimEnd() });
 
                 return { exitCode: 0, stdout: "", stderr: "" };
@@ -240,7 +381,14 @@ export const fakeApi = (overrides = {}) => {
             usage: async () => ({ context: { tokens: 48_000, window: 200_000, percent: 24 } }),
             ...overrides.session,
         },
-        ui: { toast: () => {}, log: () => {} },
+        ui: {
+            toast: () => {},
+            log: (text) => void logs.push(String(text)),
+            open: overrides.open ?? (async (args) => void opens.push(args)),
+            close: async (args) => void closes.push(args),
+            invalidate: (what) => void invalidations.push(what),
+            resolve: () => elements,
+        },
         clock: { now: () => Promise.resolve(Date.now()), sleep: async () => {} },
     };
 
@@ -254,6 +402,20 @@ export const fakeApi = (overrides = {}) => {
         store,
         tools,
         appends,
+        /** Every call into a Bun child, in order: `{ kind, argv, stdin, timeoutMs }`. */
+        children,
+        /** Every call into one child, by kind. */
+        childrenOf: (kind) => children.filter((call) => call.kind === kind),
+        /** Every document handed to `schema/memory-admin.js`, parsed, by op. */
+        adminDocs: (op) =>
+            children
+                .filter((call) => call.kind === "admin" && String(call.argv.at(-1)) === op)
+                .map((call) => JSON.parse(call.stdin ?? "{}")),
+        opens,
+        closes,
+        invalidations,
+        logs,
+        elements,
         /** Every generation document handed to the writer, parsed. */
         writes,
         /** Every row appended to a log whose path ends in `name`, parsed. */

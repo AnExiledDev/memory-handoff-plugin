@@ -89,6 +89,7 @@ describe("write-generation", () => {
 
             assert.equal(answer.ok, true);
             assert.equal(answer.memoriesWritten, 2);
+            assert.equal(answer.embedSpawned, false, "no embedder unless the document asks for one");
             assert.equal(answer.project, "github.com/owner/repo");
             assert.equal(answer.projectKind, "remote");
             assert.equal(answer.ids.length, 2);

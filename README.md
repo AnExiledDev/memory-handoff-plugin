@@ -8,17 +8,18 @@ away, and everything the session learned about your project goes with it. The
 next session rediscovers it at model cost. This plugin reads the conversation
 one more time on its way out and writes down what looked worth keeping.
 
-This is version 0.2.0 and it is still the skeleton. It forks the session at
-compaction, asks the fork for a short list of candidate memories, and writes the
-answer and what it cost to a JSONL log under `~/.claude/memory-handoff/`. There
-is a database now, described under Storage, and nothing writes memories into it
-yet. There is no search, no reranker, nothing injected back into a later prompt,
-and the extraction question is a placeholder that will be replaced by a written
-and measured one. So right now it is an instrument rather than a memory, and the
-things that make it a memory are listed under Roadmap.
+It forks the session at compaction, asks the fork for a short list of candidate
+memories, writes them to a SQLite store with their provenance and what they
+cost, and hands the matching ones back to a later prompt in the same project.
+Retrieval is local: a lexical arm and a vector arm over a small embedding model
+that runs on this machine, merged and reranked, described under Retrieval.
+Injection, the tools and the pane are described under Injection; what is still
+missing is under Roadmap.
 
 It never answers a compaction. Every `session.compact` dispatch ends in
-`next(e)`, so your compaction is whatever it already was, plus a row.
+`next(e)`, so your compaction is whatever it already was, plus a row. It never
+answers a prompt either: a `prompt.submit` always goes down to the next hook,
+with a memory block attached to it or with nothing attached to it.
 
 ## Install
 
@@ -167,7 +168,8 @@ them), `hitOutputCap`, and `memoriesWritten` with the `writeOutcome` the
 database writer returned. Every one of those readings is allowed to fail on its
 own, so a field can be `null` and the row still gets written. Outcomes are
 `extracted`, `empty`, `cold`, `threw`, `rehearsed`, `subagent` and
-`precompute`.
+`precompute`, and `overBudget` when the session has spent its generation
+ceiling.
 
 The same compaction also writes `memory.sqlite`: one `generations` row, one
 `costs` row and one `memories` row per memory, in one transaction. The index
@@ -179,11 +181,20 @@ at 2.1.273 against a declaration saying it returns a number, and subtracting a
 Promise gives you `NaN` which serialises as `null`. That cost compact-handoff 65
 of its first 66 rows.
 
-Two tools are registered. `mcp__memory-handoff__memory_status` answers with the
-row count, the most recent row, whether the plugin is live, where the data is,
-and whether it is reading compactions through the seam or its own hook.
-`mcp__memory-handoff__before_compact` is the seam's raise and is described
-above; calling it yourself gets you a denial and a row.
+**What the database contains is your work.** A `memories` row is a title and a
+body written by a fork that had just read your conversation, so it holds
+whatever that fork thought was worth keeping: file paths, decisions, the
+operator's own words, credentials if you pasted one into the session. A
+`retrievals` row holds the query it ran, and for a prompt-time retrieval the
+query is the prompt you typed. An `injections` row holds which memories went in
+front of the model and how many characters they came to, not their text. Nothing
+leaves the machine, and nothing is sent anywhere, but `memory.sqlite` is a
+plain-text record of your sessions in your home directory. Delete it and the
+plugin starts over.
+
+The tools are listed under Injection. `mcp__memory-handoff__before_compact` is
+the seam's raise and is described above; calling it yourself gets you a denial
+and a row.
 
 A seam row also carries `raise: { keys, hasToolUseId }`, the field names the
 engine built the raise out of and whether it filled in a `tool_use_id`. That is
@@ -342,8 +353,22 @@ this.
 `schema/write-generation.js` is a Bun CLI. It reads one JSON document on stdin
 and writes, in one transaction, the memories, one `generations` row and one
 `costs` row, then prints `{ ok, memoriesWritten, ids, generationId, costId,
-project, projectKind }` or `{ ok: false, reason }`. It refuses rather than
-throws, and it exits 0 either way, because its caller is a compaction hook.
+project, projectKind, embedSpawned }` or `{ ok: false, reason }`. It refuses
+rather than throws, and it exits 0 either way, because its caller is a
+compaction hook.
+
+The vectors are not written here. When the document says `embedAfter: true`
+(the hook always does) and at least one memory landed, the writer starts
+`retrieval/embed-missing.js` detached and does not wait for it: that child
+brings the runtime up if it has to, embeds every active memory that has no
+vector yet, and exits. Until it has run the new memory is found by FTS5 alone;
+the compaction is never held on a model server coming up. Nothing waits on the
+child, so `embedSpawned` only says it was started. Run it by hand to catch up a
+database whose runtime was down:
+
+```sh
+bun retrieval/embed-missing.js ~/.claude/memory-handoff/memory.sqlite
+```
 
 The pure half is `schema/generation-rows.js`: the project key, and the shape of
 each of the three rows. Pricing comes from `hooks/pricing.js`, and an unknown
@@ -702,6 +727,13 @@ a vector and it already knows how to run without one. On a failed `/health` it
 spawns `bun runtime/serve.js` detached, polls for up to five seconds, and then
 goes on regardless.
 
+Detached means its own session: the spawn goes through `setsid` when the box
+has one (`runtime/detach.js`), and the daemon ignores SIGHUP. Without both, the
+daemon sat in the Claude Code session's process group and died with that
+session's terminal, so every session paid a cold start and a prompt-time
+retrieval never found a warm runtime (measured 2026-09-17: a daemon started
+under `script` was gone the moment the pty closed).
+
 An attempt is stamped in `<db>.autostart` before the wait, and a second attempt
 inside 60 seconds spawns nothing and waits for nothing: it degrades straight
 away with `runtime: autostart attempted <N>s ago, not ready`. Without that, a
@@ -742,13 +774,22 @@ is not a failure.
 ```
 bun retrieval/search-cli.js <db> --project P --query "..." [--k 5]
         [--types feedback,project] [--status active] [--since ISO] [--until ISO]
-        [--origin manual] [--no-runtime] [--with-id] [--runtime-timeout-ms 5000]
+        [--origin manual] [--session-id ID] [--turn-id ID]
+        [--no-runtime] [--with-id] [--runtime-timeout-ms 5000]
+printf '%s' "..." | bun retrieval/search-cli.js <db> --project P --query-stdin
 bun retrieval/explain-cli.js <db> <retrievalId> [--json]
 ```
 
 `search-cli` prints the results as JSON on stdout and the retrieval id on
 stderr, so two runs of the same query diff clean. `--no-runtime` skips the
 autostart, which is how the degraded path is exercised on purpose.
+
+`--query-stdin` reads the query off stdin instead of the argv, and is what every
+caller that did not type the query itself uses: a prompt-time query is the
+prompt the person typed, and an argv is readable in `ps` by anyone on the
+machine. The whole of stdin is the query, with one trailing newline removed so
+that a pipe and a hook mean the same thing. The two spellings are the same
+retrieval; a test asserts it byte for byte.
 
 `explain-cli` re-runs nothing. It reads the trace and renders it:
 
@@ -816,12 +857,176 @@ project, which must never appear. It needs the weights; `bun test` does not.
 - **No tuning.** There is no labelled corpus, and a merge weight tuned by eye on
   ten queries is worse than a principled default.
 
+## Injection
+
+A prompt submitted by a person gets one context block of memories from earlier
+sessions in the same project, retrieved on the words they typed. The block is
+attached on the way down, `next({ ...e, context: [...(e.context ?? []), block] })`,
+because the declaration says context put on the result after `next` resolved is
+not attached at all, only logged. The hook never sets `origin` and never
+replaces the entries another hook already put there.
+
+The block reads like this, headed with the id of the retrieval that chose it so
+that a memory in the conversation can be traced to a trace in the database:
+
+```
+Memories from earlier sessions (memory-handoff, retrieval 41)
+
+1. the staging psql needs a TLS mode set
+   connections hang forever without it, and nothing says why
+
+2. one fix per pull request
+   the operator asked for it after a bundled branch was hard to revert
+```
+
+### Who gets memories
+
+`composer` and `bridge` only: Enter at the terminal, and the same person through
+Remote Control on a phone or the web client. Everything else is the engine or
+another session speaking (`sdk`, `peer`, `task-notification`,
+`scheduled-trigger`, `auto-continuation`, a plugin's own submission), and none
+of them get memories or a row.
+
+**`unclassified` is deliberately excluded.** The declaration says a channel the
+engine cannot attest arrives that way, and an injection is the thing you least
+want to hand to a turn nobody can attribute. The cost is that a prompt the
+engine failed to classify gets nothing; the alternative is injecting into a turn
+the engine itself will not vouch for.
+
+Two more submissions are left alone: one carrying a `turnId`, which was
+delivered into a turn that was already running rather than typed at an idle
+session, and one with no text, which retrieves nothing anyway. Those four
+refusals are the only path that writes no `injections` row, because a prompt
+memories were never owed is not a retrieval that failed.
+
+### The caps, and what happens when they bind
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MEMORY_HANDOFF_INJECT_K` | `5` | How many memories the retrieval is asked for. |
+| `MEMORY_HANDOFF_INJECT_MAX_ENTRIES` | `5` | How many may go into the block. |
+| `MEMORY_HANDOFF_INJECT_MAX_CHARS` | `4000` | How large the whole block may be. |
+
+Whole memories are dropped, lowest-ranked first, and nothing is ever cut
+mid-body: half a memory reads as a memory and is one the model cannot check.
+That is why `clipped_chars` on every row this writes is zero: the column is the
+schema's, and this implementation has no path that clips. `dropped` says how
+many candidates did not fit.
+
+### When the retrieval does not answer
+
+The retrieval runs as a Bun child (`retrieval/search-cli.js`, handed the prompt
+over stdin rather than on its argv, where `ps` would show it) bounded by
+`MEMORY_HANDOFF_INJECT_TIMEOUT_MS`, 2500 ms by default, and the embedding
+runtime inside it is bounded lower still so it has time to write its own
+degraded row before it is killed. On a timeout, a non-zero exit or output that
+is not a document, **the prompt goes down with no memories and no delay beyond
+the bound**, and the failure is recorded rather than swallowed.
+
+The schema has no disposition column and this slice adds no DDL, so a pair of
+rows carries what happened:
+
+- **Injected.** A whole `retrievals` row, and an `injections` row beside it
+  holding the memory ids, the characters and the caps.
+- **Rehearsed** (`MEMORY_HANDOFF_LIVE` off). A whole `retrievals` row, because
+  the search really ran, and an `injections` row with no ids and no characters,
+  `dropped` equal to everything that was found. Nothing reached the model.
+- **Failed.** A `retrievals` row with `returned_n = 0` and the reason in
+  `degraded` and in `filters.failure_reason`, and an `injections` row with no
+  ids hanging off it.
+
+Retrieval runs even when `MEMORY_HANDOFF_LIVE` is off, which is the point of
+rehearsing: you can watch what a session would have been given, in the pane and
+in the database, before you let it reach a model.
+
+### The tools
+
+| Tool | Arguments | What it answers |
+| --- | --- | --- |
+| `memory_search` | `query`, `k?`, `types?` | This project's matching memories with their scores and the retrieval id that explains the ranking. |
+| `memory_explain` | `retrievalId` | Why one retrieval ranked what it did: its filters, every candidate, and each stage's score. |
+| `memory_status` | none | Whether the plugin is live, where its database is, whether it is reading compactions through the seam or its own hook, what this session has written, retrieved, injected and spent, and what the whole store holds, including `database.unembedded`: active memories still without a vector, which is the number that says the vector arm is not seeing them. |
+| `memory_list` | `limit?`, `offset?`, `status?` | This project's memories newest first, whether or not they match anything. |
+| `memory_delete` | `id`, `purge?` | Removes a memory. Tombstoned by default; `purge: true` deletes the row. |
+
+A tombstone keeps the text and stops retrieval returning it, so a memory
+somebody removed is still evidence of what a generation wrote. `purge` is the
+real delete for text that has to go; the id stays in `injections.memory_ids`
+either way, so the record that it was once injected survives the text.
+
+Every tool is a hook of its own on `tool.call`, every one answers a JSON
+document, and every failure is `{ ok: false, reason }` in the result rather than
+a raise: a memory tool that throws takes the turn with it.
+
+### The pane
+
+A pane titled **Memories**, id `memory-handoff`, lists what this session has
+been given: the prompt each retrieval ran on, the memories it chose with their
+final score, and the characters and estimated tokens each block came to. The
+estimate is characters over four, named an estimate everywhere it appears,
+because the engine's tokenizer is not reachable from a hook.
+
+It opens the first time something is injected. Opening it at `session.start`
+would give you a pane with nothing in it, taking a third of the terminal to say
+so. **Close it and it stays closed** for the rest of the session; the plugin
+remembers a close whose origin is the person and never reopens. It is redrawn
+after each injection.
+
+### Verified live
+
+`bench/verify-injection.py` drives real Claude Code sessions through all of
+this in a pty, against an isolated config dir, data dir and throwaway git
+repository, and reads its verdicts off the rows the plugin wrote rather than off
+the screen. Six checks: `compact` (a compaction becomes memories through
+compact-handoff's seam, and they get vectors), `inject` (a later session is
+handed them and answers from them, with every built-in tool and the memory tools
+taken away so it cannot look them up itself), `pane`, `rehearse`
+(`MEMORY_HANDOFF_LIVE` off: the row is written and nothing reaches the model),
+`tool` and `headless`. It needs
+`pexpect`, a logged-in Claude Code, and compact-handoff beside this plugin or
+`COMPACT_HANDOFF_PLUGIN`; it costs a few cents of model time per run.
+
+```sh
+python3 bench/verify-injection.py setup
+python3 bench/verify-injection.py run all
+python3 bench/verify-injection.py table
+```
+
+Two things it caught that no unit test could: the autostarted runtime dying
+with the session's pty, and every "this session" value living in `$.store`,
+which is one file kept between sessions, so the pane opened in the first
+session and never again. Both are fixed at the root and documented where the
+code is. Claude Code's own auto-memory is off in the sessions it drives, because
+it wrote the planted fact into the config dir and loaded it into every later
+session, which read exactly like an injection. The answering sessions run with
+`--tools ""` because a haiku session, asked the planted question with Bash and
+Grep still available, went and found the fact in an old transcript on disk. And
+`compact` mints a fresh pair of facts every run: the store hands the last pair
+back on the facts prompt itself, and a fork asked to extract what the session
+was already given correctly writes nothing (three empty generations, haiku and
+sonnet, before that was understood).
+
+### Headless
+
+`$.model.fork` is always null headless, so nothing is generated under
+`claude -p`, and there is no terminal surface, so the pane's open fails and is
+logged rather than swallowed. Retrieval, injection and every tool work
+normally: a headless session with a populated database is handed memories the
+same way an interactive one is.
+
 ## Settings
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `MEMORY_HANDOFF_LIVE` | off | Off, every compaction writes a `rehearsed` row and no fork runs. On, it forks. |
-| `MEMORY_HANDOFF_DIR` | `~/.claude/memory-handoff` | Where rows and replies are kept. |
+| `MEMORY_HANDOFF_LIVE` | off | Off, every compaction writes a `rehearsed` row and no fork runs, and every prompt's retrieval runs and attaches nothing. On, it forks and it injects. |
+| `MEMORY_HANDOFF_DIR` | `~/.claude/memory-handoff` | Where rows, replies and `memory.sqlite` are kept. |
+| `MEMORY_HANDOFF_SESSION_BUDGET_USD` | `1.00` | What one session's generations may cost. A compaction past it writes an `overBudget` row and never forks. Zero or less is no ceiling. |
+| `MEMORY_HANDOFF_INJECT_K` | `5` | How many memories a prompt's retrieval asks for. |
+| `MEMORY_HANDOFF_INJECT_MAX_ENTRIES` | `5` | How many may go into one injected block. |
+| `MEMORY_HANDOFF_INJECT_MAX_CHARS` | `4000` | How large one injected block may be. |
+| `MEMORY_HANDOFF_INJECT_TIMEOUT_MS` | `2500` | Hard bound on the retrieval child at prompt time. Past it the prompt goes down with no memories. Measured 2026-09-17: ~430 ms warm, ~1650 ms when the child has to start the runtime. |
+
+The runtime's four variables are in its own section, under Runtime.
 
 ## What it costs
 
@@ -852,19 +1057,19 @@ sums as if the call were free.
 
 ## Roadmap
 
-This is the first slice of AnExiledDev/claude-investigations#678, which is where
-the design lives. The SQLite schema with provenance and lifecycle is in, the
-graded generation prompt is in, and a compaction now writes memories. The local
-embedding model (`BAAI/bge-small-en-v1.5`) and reranker
-(`jinaai/jina-reranker-v1-tiny-en`) are in too, as the loopback daemon
-documented under Runtime, and hybrid retrieval over both of them is in as a
-function and two CLIs. What is still missing: injection on `prompt.submit` and
-on no other kind of turn, a pane showing what this session was given, and the
-rest of the tools.
+This is AnExiledDev/claude-investigations#678, which is where the design lives.
+The SQLite schema with provenance and lifecycle is in, the graded generation
+prompt is in, a compaction writes memories, the local embedding model
+(`BAAI/bge-small-en-v1.5`) and reranker (`jinaai/jina-reranker-v1-tiny-en`) are
+in as the loopback daemon documented under Runtime, hybrid retrieval over both
+arms is in, and a person's prompt is now given what it finds.
 
-Until those land the honest description is that this plugin writes memories
-down, and reads them back only when you ask it to from a terminal. Nothing is
-injected, and no session has ever been handed one of these rows.
+What is still missing: nothing prunes or ages the store, so a memory written six
+months ago competes with one written this morning on rank alone; there is no
+recency or importance weighting in the score; nothing dedups near-identical
+memories a second compaction writes again; and no injection has been graded
+against a labelled corpus, so "the right memories were chosen" is a claim this
+repository cannot yet make.
 
 ## Known limits
 
