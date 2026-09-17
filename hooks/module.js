@@ -41,6 +41,7 @@
  */
 
 import { projectKey } from "../schema/generation-rows.js";
+import { forkInputOf } from "./fork-input.js";
 import { composeInjection, finalScoreOf, injectionGate, promptLine } from "./inject.js";
 import { paneTree } from "./pane.js";
 import { parseReply } from "./parse.js";
@@ -58,12 +59,18 @@ import { GENERATION_PROMPT } from "./prompt.js";
  * conversation that established nothing durable is a generation that worked:
  * `wrote` with `memories_written = 0`. `empty` is the other thing, a reply that
  * carried no block at all.
+ *
+ * `mismatch` is written as `failed` because `generations.outcome` carries a
+ * CHECK listing the six strings it takes, and widening it means rebuilding the
+ * table under a live database. The refusal is not lost: `outcome_reason` names
+ * both token counts, and the index row's own outcome is `mismatch`.
  */
 const DB_OUTCOMES = {
     extracted: "wrote",
     empty: "empty",
     cold: "cold",
     threw: "failed",
+    mismatch: "failed",
     subagent: "skipped",
     precompute: "skipped",
     overBudget: "overBudget",
@@ -457,14 +464,30 @@ const generate = async ($, about, via) => {
         }
 
         const text = typeof reply.text === "string" ? reply.text : "";
-        const parsed = parseReply(text);
 
         record.usage = reply.usage ?? null;
         record.replyChars = text.length;
+        record.forkInput = forkInputOf(record.usage, record.context);
         // Priced here and not only in the writer, because the ceiling above has
         // to hold in the session that is spending, not in the next one that
         // reads the table.
         await safely($, () => bumpSession($, { spendUsd: priceUsage(record.usage, record.model).usd ?? 0 }));
+
+        // A fork charged for a fraction of the context answered over a
+        // transcript that is not this conversation, and a memory from the wrong
+        // conversation is worse than none: it is injected into every later
+        // prompt and nothing on it says where it came from. The tokens are
+        // spent either way, so the row keeps the usage and is priced on it.
+        if (record.forkInput.matchesContext === false) {
+            record.detail =
+                `the fork was charged for ${record.forkInput.sent} input tokens against a ` +
+                `${record.forkInput.contextTokens} token context, so it did not read this conversation`;
+
+            return finish($, record, "mismatch", startedAt);
+        }
+
+        const parsed = parseReply(text);
+
         record.parsedRows = parsed.rows.length;
         record.rejectedRows = parsed.rejected.length;
         record.rejected = parsed.rejected.slice(0, MAX_REJECTED_REASONS);
@@ -504,6 +527,9 @@ const blankRecord = async ($, about, via) => {
         outcome: "",
         detail: "",
         usage: null,
+        // Null on every row that never forked: a subagent's compaction, a
+        // precompute, a rehearsal and a refused raise have nothing to compare.
+        forkInput: null,
         replyChars: null,
         parsedRows: null,
         rejectedRows: null,
@@ -650,6 +676,12 @@ const reasonFor = (record) => {
 
     if (record.outcome === "overBudget") {
         return `the session's generation budget is spent: ${record.detail}`;
+    }
+
+    // Named in the reason because the column itself has to say `failed`: this is
+    // the only thing in the database that tells a refused fork from a throw.
+    if (record.outcome === "mismatch") {
+        return `mismatch: ${record.detail}`.slice(0, 200);
     }
 
     if (record.outcome === "threw") {
