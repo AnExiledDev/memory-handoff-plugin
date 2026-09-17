@@ -446,6 +446,60 @@ describe("the row a compaction leaves behind", () => {
     });
 });
 
+describe("the session's generation budget", () => {
+    // Two thousand output tokens of Sonnet 5 is two cents, so one fork of this
+    // shape spends a one-cent ceiling and the next compaction never forks.
+    const expensiveReply = () => ({
+        ...forkReply(),
+        usage: { input_tokens: 12, cache_read_input_tokens: 48_000, cache_creation_input_tokens: 0, output_tokens: 2_000 },
+    });
+
+    it("stops forking once the session has spent its ceiling, and says so on the row", async () => {
+        let forks = 0;
+        const host = fakeApi({
+            env: { MEMORY_HANDOFF_SESSION_BUDGET_USD: "0.01" },
+            fork: async () => {
+                forks += 1;
+
+                return expensiveReply();
+            },
+        });
+        const runtime = await started(host);
+
+        await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());
+        await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());
+
+        const rows = host.rowsIn("index.jsonl");
+
+        assert.equal(forks, 1);
+        assert.equal(rows[0].outcome, "extracted");
+        assert.equal(rows[1].outcome, "overBudget");
+        assert.equal(rows[1].detail, "0.0200 spent of a 0.01 session ceiling");
+    });
+
+    it("has no ceiling at all when the budget is set to zero", async () => {
+        let forks = 0;
+        const host = fakeApi({
+            env: { MEMORY_HANDOFF_SESSION_BUDGET_USD: "0" },
+            fork: async () => {
+                forks += 1;
+
+                return expensiveReply();
+            },
+        });
+        const runtime = await started(host);
+
+        await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());
+        await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());
+
+        assert.equal(forks, 2);
+        assert.deepEqual(
+            host.rowsIn("index.jsonl").map((row) => row.outcome),
+            ["extracted", "extracted"],
+        );
+    });
+});
+
 describe("memory_status", () => {
     it("registers and answers with the row count and the last row", async () => {
         const host = fakeApi();
@@ -453,7 +507,7 @@ describe("memory_status", () => {
 
         assert.deepEqual(
             host.tools.map((spec) => spec.name),
-            ["before_compact", "memory_status"],
+            ["before_compact", "memory_status", "memory_search", "memory_explain", "memory_list", "memory_delete"],
         );
 
         await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());
