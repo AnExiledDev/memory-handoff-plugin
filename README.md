@@ -660,6 +660,10 @@ const found = await search(
 // { retrievalId, degraded, results: [{ memoryId, title, body, scores }] }
 ```
 
+`k` is clamped to the rerank cap of 30, because 30 merged candidates is all the
+reranker is ever shown; a larger `k` would return unreranked filler as though it
+had been ranked. The trace records `k_clamped_from` when that happens.
+
 `query` is the raw prompt, recorded as `query_source = 'raw-prompt'`. There is
 no query rewriting or expansion: a rewrite is a model call in front of every
 prompt, and the thing being searched is 50 to 500 short memories, not a corpus.
@@ -696,7 +700,22 @@ as a real effect.
 Retrieval owns the daemon's autostart, because it is the first caller that needs
 a vector and it already knows how to run without one. On a failed `/health` it
 spawns `bun runtime/serve.js` detached, polls for up to five seconds, and then
-goes on regardless. **It never blocks the prompt.**
+goes on regardless.
+
+An attempt is stamped in `<db>.autostart` before the wait, and a second attempt
+inside 60 seconds spawns nothing and waits for nothing: it degrades straight
+away with `runtime: autostart attempted <N>s ago, not ready`. Without that, a
+wedged port costs a fresh detached process and the whole five-second window on
+every single search.
+
+**The honest bound is ensure + embed + rerank**, not "it never blocks". The
+runtime reports a load that has only *begun* as ready, so a call can still land
+on a server that is loading ONNX sessions; retrieval races every runtime call
+against `runtimeTimeoutMs` (default 5000 ms, `--runtime-timeout-ms` on the CLI)
+and treats an expiry as a degraded rung with its reason on the trace, never as
+an exception. Worst case for a prompt is the five-second start window plus one
+embed timeout plus one rerank timeout. A `{ db, client }` caller that builds its
+own client owns the client's own timeout as well.
 
 ### Degradation
 
@@ -707,6 +726,12 @@ Three rungs, and none of them is an empty result or an exception:
 | The runtime is down or the weights are missing | FTS5 only, merged and returned | `vector: unavailable` |
 | The reranker alone failed | The merged order, uncut | `rerank: unavailable` |
 | Both | FTS5 only, merge order | `vector: unavailable; rerank: unavailable` |
+| `/embed` did not answer inside the timeout | FTS5 only, merged and returned | `vector: unavailable` |
+| `/rerank` did not answer inside the timeout | The merged order, uncut | `rerank: unavailable` |
+
+A not-ready runtime short-circuits both arms: nothing is posted to `/rerank`
+after `ensureRuntime` has already said the daemon is not up, and both rungs
+carry that same reason.
 
 A query with nothing searchable in it ("ok", "thanks") returns nothing, makes no
 model call, and records the reason. That is a large share of real prompts and it
@@ -717,7 +742,7 @@ is not a failure.
 ```
 bun retrieval/search-cli.js <db> --project P --query "..." [--k 5]
         [--types feedback,project] [--status active] [--since ISO] [--until ISO]
-        [--origin manual] [--no-runtime] [--with-id]
+        [--origin manual] [--no-runtime] [--with-id] [--runtime-timeout-ms 5000]
 bun retrieval/explain-cli.js <db> <retrievalId> [--json]
 ```
 
@@ -751,6 +776,25 @@ A candidate only the vector arm found has no `fts#`; one only the lexical arm
 found has no `vec#`. The `cut` column is why a candidate is not in the answer,
 and a memory dropped by a caller's `--types` gets a row saying so rather than
 vanishing.
+
+### What the trace keeps in `retrievals.filters`
+
+`retrievals` has columns for the counts, the timings and the fact of a
+degradation, and none for the why. Until a ticket adds them, this JSON column
+carries the rest, and `explain` renders it:
+
+| Key | What it says |
+| --- | --- |
+| `project`, `status`, `types`, `since`, `until` | The metadata filter, as asked for |
+| `match_expression` | The FTS5 MATCH the query was turned into |
+| `query_chars`, `query_truncated`, `query_truncated_to` | The prompt's length, and where it was cut for the embedder |
+| `query_empty_reason` | Why a prompt had nothing searchable in it |
+| `rrf_k`, `arm_limit`, `rerank_cap`, `runtime_timeout_ms` | The constants that run was made under |
+| `vectors_scanned` | How many stored vectors the brute-force arm compared |
+| `vectors_skipped_dim` | Stored vectors skipped because their width is not the query's |
+| `vector_no_rows_for_model` | The model that answered, when the corpus has embeddings and none are its |
+| `vector_unavailable_reason`, `rerank_unavailable_reason` | Why each rung degraded |
+| `k_clamped_from` | The `k` that was asked for, when it exceeded the rerank cap |
 
 ### A database to try it on
 
