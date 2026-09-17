@@ -292,7 +292,7 @@ const adminAnswer = (argv, options) => {
  */
 export const elementTable = () =>
     Object.fromEntries(
-        ["Box", "Text", "Code", "Button", "Link", "Input", "Select"].map((name) => [
+        ["Box", "Text", "Code", "Button", "Link", "Input", "Select", "Markdown"].map((name) => [
             name,
             (props = {}) => ({ element: name, props }),
         ]),
@@ -318,6 +318,18 @@ export const paneLines = (tree) =>
         .map((node) => String(node.props.children ?? ""));
 
 /**
+ * Every line the pane puts in front of a person, in order: a `Text`'s child and
+ * a `Button`'s label alike.
+ *
+ * Since 0.7.0 a memory row is a `Button`, so `paneLines` alone no longer sees
+ * the rows — which is what a width assertion most needs to see.
+ */
+export const paneLabels = (tree) =>
+    paneNodes(tree)
+        .filter((node) => node.element === "Text" || node.element === "Button")
+        .map((node) => String(node.props.label ?? node.props.children ?? ""));
+
+/**
  * The `$` a hook is handed.
  *
  * `clock.now` deliberately answers a Promise, which is what engine 2.1.273 does
@@ -337,6 +349,7 @@ export const fakeApi = (overrides = {}) => {
     const invalidations = [];
     const logs = [];
     const elements = elementTable();
+    const scrolls = [];
 
     files.set("/plugin/.claude-plugin/plugin.json", JSON.stringify({ version: "0.1.0-test" }));
 
@@ -405,6 +418,7 @@ export const fakeApi = (overrides = {}) => {
             close: async (args) => void closes.push(args),
             invalidate: (what) => void invalidations.push(what),
             resolve: () => elements,
+            scroll: async (args) => void scrolls.push(args),
         },
         clock: { now: () => Promise.resolve(Date.now()), sleep: async () => {} },
     };
@@ -431,6 +445,7 @@ export const fakeApi = (overrides = {}) => {
         opens,
         closes,
         invalidations,
+        scrolls,
         logs,
         elements,
         /** Every generation document handed to the writer, parsed. */

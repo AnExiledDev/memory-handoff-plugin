@@ -1191,6 +1191,35 @@ so. **Close it and it stays closed** for the rest of the session; the plugin
 remembers a close whose origin is the person and never reopens. It is redrawn
 after each injection.
 
+**Press a memory row and it opens in place.** Since 0.7.0 each row is a
+`Button` rather than a line of text: Enter on the focused row, or a click, draws
+that memory's own text beneath it as the markdown it is, in a `Markdown`
+element with the surface's own renderer. Press it again and it closes; pressing
+another row moves the open one. The focus ring starts on the first row
+(`autoFocus`), so Enter acts on something the moment the pane takes the
+keyboard, and opening a row calls `$.ui.scroll` with `block: "nearest"` — a row
+already whole in the window does not move, so pressing down a list does not
+yank it.
+
+This is the answer to the question the pane always raised and could not answer:
+*what did it actually put in my prompt?* Before, the row named a memory and the
+text was a `memory_explain` call away, which costs a turn. Now it is one
+keypress and no model call at all.
+
+Three details that are deliberate rather than incidental:
+
+- **The text comes from this session's own composed block**, bounded to 8,000
+  characters per memory when the row is recorded. Nothing reads the database
+  inside a render hook.
+- **`Markdown` takes at most 10,000 characters and is refused over it**, and a
+  refused element takes the whole drawing with it, so the text is trimmed to the
+  ceiling before it is handed over. Everything else the pane draws is still cut
+  to the body width, because the pane scrolls vertically and `Code`'s wrap
+  overdraw at 2.1.269 is what a wrapped line looks like in the wrong element.
+- **A surface without `Button` or `Markdown` still gets a pane.** The rows fall
+  back to the `Text` lines they were and an open memory draws as width-cut
+  lines, so nothing here is load-bearing on a surface that cannot press.
+
 ### Verified live
 
 `bench/verify-injection.py` drives real Claude Code sessions through all of

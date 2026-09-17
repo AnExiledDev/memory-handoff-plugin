@@ -5,6 +5,7 @@ import {
     elementTable,
     fakeApi,
     fakeRuntime,
+    paneLabels,
     paneLines,
     paneNodes,
     passThrough,
@@ -486,7 +487,7 @@ describe("the pane", () => {
         assert.deepEqual(answer, { passedThrough: true });
     });
 
-    it("draws this session's injections with Box and Text alone", async () => {
+    it("draws this session's injections with Box, Text and Button alone", async () => {
         const host = fakeApi();
         const runtime = await started(host);
 
@@ -496,10 +497,17 @@ describe("the pane", () => {
         const nodes = paneNodes(tree);
 
         assert.ok(nodes.length > 0);
-        assert.deepEqual([...new Set(nodes.map((node) => node.element))].sort(), ["Box", "Text"]);
+        // No `Code`: at 2.1.269 it honours `wrap` when drawing and reports its
+        // height unwrapped, so a long line paints over the row beneath it. No
+        // `div`/`span`/`b` either; they stopped being elements at 2.1.267.
+        assert.deepEqual([...new Set(nodes.map((node) => node.element))].sort(), ["Box", "Button", "Text"]);
         // Every child goes in `props.children`: a positional child draws an
         // empty frame and still settles the dispatch.
-        assert.ok(nodes.every((node) => node.props.children !== undefined || node.element === "Text"));
+        assert.ok(
+            nodes.every(
+                (node) => node.props.children !== undefined || node.element === "Text" || node.element === "Button",
+            ),
+        );
     });
 
     it("draws no line wider than the pane", async () => {
@@ -508,7 +516,7 @@ describe("the pane", () => {
 
         await runtime.dispatch("prompt.submit", host.$, promptInput({ text: "x".repeat(400) }), passThrough());
 
-        const lines = paneLines(await render(runtime, host));
+        const lines = paneLabels(await render(runtime, host));
 
         assert.ok(lines.length > 0);
         assert.ok(lines.every((line) => line.length <= 80), lines.find((line) => line.length > 80));
@@ -520,11 +528,42 @@ describe("the pane", () => {
 
         await runtime.dispatch("prompt.submit", host.$, promptInput(), passThrough());
 
-        const lines = paneLines(await render(runtime, host));
+        const lines = paneLabels(await render(runtime, host));
 
         assert.ok(lines.some((line) => line.includes("why did the cron job stop")));
         assert.ok(lines.some((line) => line.includes("retrieval 7")));
         assert.ok(lines.some((line) => line.includes("rerank 2.2500")));
+    });
+
+    it("opens a memory in place when its row is pressed, and closes it when pressed again", async () => {
+        const host = fakeApi();
+        const runtime = await started(host);
+
+        await runtime.dispatch("prompt.submit", host.$, promptInput(), passThrough());
+
+        const rowOf = (tree) => paneNodes(tree).find((node) => node.element === "Button");
+        const bodies = (tree) => paneNodes(tree).filter((node) => node.element === "Markdown");
+
+        assert.equal(bodies(await render(runtime, host)).length, 0);
+
+        rowOf(await render(runtime, host)).props.onPress();
+
+        // `onPress` is declared `() => void` and the surface does not wait on
+        // it, so the redraw and the scroll settle on a later tick.
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.equal(bodies(await render(runtime, host)).length, 1);
+        assert.deepEqual(host.scrolls.at(-1), {
+            in: "memory-handoff",
+            to: { key: "entry:0:0" },
+            block: "nearest",
+        });
+
+        rowOf(await render(runtime, host)).props.onPress();
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.equal(bodies(await render(runtime, host)).length, 0);
+        assert.equal(host.scrolls.length, 1, "closing a row scrolls nothing");
     });
 
     it("says so while it is rehearsing", async () => {
