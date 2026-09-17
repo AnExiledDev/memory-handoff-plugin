@@ -97,9 +97,6 @@ const MAX_DETAIL_CHARS = 2000;
  * - `MEMORY_HANDOFF_LIVE` off, it rehearses: it writes a row saying what it
  *   would have done and spends nothing.
  * - `MEMORY_HANDOFF_DIR` where the rows and replies are kept.
- * - `MEMORY_HANDOFF_MODEL` recorded on the row as the model that was asked for.
- *   `$.model.fork` takes `{ prompt }` and nothing else, so it steers no call
- *   yet; #681 is where it starts meaning something.
  */
 export const register = (on) => {
     on("session.start", async ($, e, next) => {
@@ -310,7 +307,6 @@ const blankRecord = async ($, about, via) => {
         sessionId: await safely($, () => $.session.id()),
         cwd: await safely($, () => $.session.cwd()),
         model: await safely($, () => $.session.model()),
-        modelRequested: await modelAlias($),
         trigger: about.trigger,
         agentId: about.agentId,
         messagesIn: about.messagesIn,
@@ -611,12 +607,6 @@ const dataDir = async ($) => {
 };
 
 const isLive = async ($) => isOn(await $.env.get("MEMORY_HANDOFF_LIVE"));
-
-const modelAlias = async ($) => {
-    const alias = ((await $.env.get("MEMORY_HANDOFF_MODEL")) ?? "").trim();
-
-    return alias === "" ? null : alias;
-};
 
 const isOn = (value) => ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
 
