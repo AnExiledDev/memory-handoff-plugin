@@ -309,8 +309,9 @@ tables, no `RETURNING` and no `->>` operator; it runs on the 3.53.0 inside
 ## Generation
 
 The prompt the fork is asked is `GENERATION_PROMPT` in `hooks/prompt.js`, and
-the same text is `bench/prompts/v2.txt`, which is the arm the numbers below were
-measured on. A test asserts the constant and the file are byte for byte equal,
+the same text is `bench/prompts/v3.txt`. The numbers below were measured on
+`v2.txt`; v3 adds one write-list bullet and has not been re-graded (see the
+table's note). A test asserts the constant and the file are byte for byte equal,
 because a bench that grades a file while the hook forks a constant measures
 nothing.
 
@@ -433,7 +434,7 @@ appears in the output or it does not.
 
 ```
 PATH=~/.bun/bin:$PATH python3 bench/run.py --fixture ledgerctl --repeat 2 \
-    --arm v2 --model claude-opus-5 --grader claude-sonnet-5
+    --arm v3 --model claude-opus-5 --grader claude-sonnet-5
 ```
 
 Reports land in `bench/.runs/`, which is gitignored. Replicates run one at a
@@ -452,6 +453,15 @@ roadmap item, written down as a constraint on how much to build now. The whole
 difference in v2 is two sentences in the never-write paragraph, naming a plan
 for a future quarter outright and saying that a roadmap arriving as a reason to
 do less work is still a roadmap. v2 ships.
+
+**v3 ships, unmeasured on this bench.** It is v2 plus one write-list bullet:
+anything the person explicitly asked to have remembered is written, and that
+one case is carved out of the never-write list's precedence. The change came
+from the live verifier (`bench/verify-injection.py`, 2026-09-17), where a fork
+under v2 answered an empty block to a session whose only content was two facts
+the person had asked it to remember; both read as session state. The ledgerctl
+fixture plants no explicit request, so this bench cannot see the difference,
+and the verifier's `compact` and `inject` checks are the measurement for it.
 
 Read the numbers as a floor rather than a score. Two replicates cannot separate
 0.966 from 0.93, the recall spread is wider than the gap between the arms on

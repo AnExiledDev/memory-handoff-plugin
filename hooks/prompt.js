@@ -28,8 +28,13 @@
  * Which file in `bench/prompts/` this constant is, and so which measured run in
  * the README is about it. v1 leaked a roadmap item on both replicates; v2 is v1
  * with the never-write paragraph naming a plan for a future quarter outright.
+ * v3 is v2 with one write-list bullet: a fact the person explicitly asked to
+ * have remembered is written even when it reads like state. Under v2 a live
+ * fork answered an empty block to a conversation whose only content was two
+ * facts the person had asked it to remember (`bench/verify-injection.py`,
+ * 2026-09-17), because both looked like session state to the never-write list.
  */
-export const GENERATION_PROMPT_ARM = "v2";
+export const GENERATION_PROMPT_ARM = "v3";
 
 /** At most this many memories out of one compaction. */
 export const MAX_MEMORIES = 25;
@@ -57,6 +62,7 @@ Write:
 - A fact about this repo or operator that a fresh session would waste time rediscovering.
 - A build flag, harness quirk, environment limit, or non-obvious "why" not in git, an ADR, or a comment.
 - A standing operator preference or correction.
+- Anything the person explicitly asked you to remember, in their words. A request to remember is itself the fact that qualifies it.
 
 Never write:
 - Policy, process, orchestration. Those are rules; they go in \`~/.claude/rules/\`.
@@ -64,7 +70,7 @@ Never write:
 - Anything git, the tracker, or \`AGENTS.md\` already holds.
 - Secrets. Name the path, never the value.
 
-The never-write list outranks the write list. A branch name, a commit SHA, what you were about to do next, which tests are currently failing, a plan for a future quarter, and anything you read out of an \`AGENTS.md\` or \`CLAUDE.md\` file are all worthless a week from now, and a database full of them is worse than an empty one. A roadmap is still a roadmap when it arrives as a reason to do less work now: write down the measured fact it rests on if there is one, and let the plan itself go. If a secret was pasted into this conversation, the memory names the file or the variable it lives in and never the value itself; quoting a token into a memory is the one mistake here that cannot be undone.
+The never-write list outranks the write list, with one exception: something the person asked you to remember is written even when it looks like state, because they are the one who decides what is worth keeping about their own project. A branch name, a commit SHA, what you were about to do next, which tests are currently failing, a plan for a future quarter, and anything you read out of an \`AGENTS.md\` or \`CLAUDE.md\` file are all worthless a week from now, and a database full of them is worse than an empty one. A roadmap is still a roadmap when it arrives as a reason to do less work now: write down the measured fact it rests on if there is one, and let the plan itself go. If a secret was pasted into this conversation, the memory names the file or the variable it lives in and never the value itself; quoting a token into a memory is the one mistake here that cannot be undone.
 
 Consider each of these four types in turn, and let a type be empty if this conversation established nothing of that kind. Most conversations fill one or two.
 

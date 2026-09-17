@@ -50,6 +50,14 @@ describe("GENERATION_PROMPT", () => {
         assert.match(GENERATION_PROMPT, /A roadmap is still a roadmap when it arrives as a reason to do less work now/u);
     });
 
+    // Under v2 a live fork answered an empty block to a conversation that was
+    // nothing but two facts the person asked it to remember. This bullet, and
+    // the exception it carves out of the never-write list, is the whole of v3.
+    it("writes what the person explicitly asked to remember, above the never-write list", () => {
+        assert.match(GENERATION_PROMPT, /^- Anything the person explicitly asked you to remember, in their words\./mu);
+        assert.match(GENERATION_PROMPT, /with one exception: something the person asked you to remember is written even when it looks like state/u);
+    });
+
     it("carries auto-memory's two lists verbatim, including the secrets line", () => {
         for (const line of [
             "A fact about this repo or operator that a fresh session would waste time rediscovering.",
