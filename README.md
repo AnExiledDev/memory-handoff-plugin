@@ -449,6 +449,9 @@ curl -s 127.0.0.1:8794/health
 curl -s -XPOST 127.0.0.1:8794/shutdown
 ```
 
+Retrieval starts one for you when it needs a vector and `/health` fails, so the
+command above is for watching it rather than a step you have to remember.
+
 It binds `127.0.0.1` and nothing else, has no authentication and wants none: the
 port is not reachable from off the box. It warms both models behind the listen,
 so `/health` answers immediately and says `ready: false` with a reason until the
@@ -618,12 +621,11 @@ Validating hooks: .../probe-plugin/hooks/hooks.json
 
 ### Not handled
 
-- **Nothing calls this yet.** The hook does not know the runtime exists;
-  wiring the client into generation and retrieval is
-  claude-investigations#683 and #684.
-- **Nothing starts the daemon for you.** It is a command you run. Supervision,
-  autostart on first embed, and a lock so two sessions cannot both spawn one are
-  all unbuilt.
+- **No hook calls this yet.** Retrieval does (see below, it starts the daemon
+  on demand); the hook that calls retrieval is claude-investigations#684.
+- **No supervision, and no lock.** Retrieval starts a daemon when `/health`
+  fails, so two sessions racing a cold start can both spawn one; the loser's
+  listen fails and its process exits. Nothing restarts a daemon that dies.
 - **One runtime per process.** transformers.js keeps its model path in a
   process-global `env`, so two `createRuntime()` instances pointed at different
   directories in one process would fight. The daemon holds exactly one.
@@ -636,6 +638,183 @@ Validating hooks: .../probe-plugin/hooks/hooks.json
   comparable with another's; `/health` reports the exact model, revision and
   dtype so a stored vector can be attributed, and the schema records it, but
   nothing re-embeds on a change.
+
+## Retrieval
+
+Hybrid retrieval over the memories a compaction wrote: a metadata filter, then
+FTS5 and vector search side by side, fused by reciprocal rank fusion, reranked
+by the cross-encoder, and cut to `k`. Every run writes a `retrievals` row and
+one `retrieval_candidates` row per candidate considered, including the ones that
+did not make it, so "why did I get that memory" is a query and not a guess.
+
+Nothing injects yet. This is the function and the two CLIs; the hook that calls
+it on `prompt.submit` is claude-investigations#684.
+
+```js
+import { search } from "./retrieval/search.js";
+
+const found = await search(
+    { query: prompt, project: "github.com/owner/repo", k: 5, origin: "prompt" },
+    { db, client },
+);
+// { retrievalId, degraded, results: [{ memoryId, title, body, scores }] }
+```
+
+`k` is clamped to the rerank cap of 30, because 30 merged candidates is all the
+reranker is ever shown; a larger `k` would return unreranked filler as though it
+had been ranked. The trace records `k_clamped_from` when that happens.
+
+`query` is the raw prompt, recorded as `query_source = 'raw-prompt'`. There is
+no query rewriting or expansion: a rewrite is a model call in front of every
+prompt, and the thing being searched is 50 to 500 short memories, not a corpus.
+A prompt longer than the embedder's window is truncated deterministically and
+the trace records that it was.
+
+### The two arms and the merge
+
+The lexical arm is `bm25(memories_fts, 3.0, 1.0)` — title weighted 3x body,
+negative, **lower is better**. The vector arm is cosine over the unit vectors in
+`embeddings`, brute force across the filtered set, which on this many rows is a
+few milliseconds and needs no index. Both arms take the same 30-row cap.
+
+They are fused by **reciprocal rank fusion**, `score = Σ 1/(60 + rank)` over the
+arms a memory appeared in. The two arms' scores are not comparable and cannot be
+made comparable at this size: BM25 is negative and unbounded, cosine is bounded,
+and a min-max normalisation over twenty candidates is degenerate the moment one
+arm returns a single row. RRF reads ranks only, so neither scale can leak into
+the other. `RRF_K = 60` is the constant from the original paper, a damping term
+rather than a tuned weight; there is no labelled corpus here to tune against.
+
+The merged top 30 go to `/rerank` in **one** call, and the cross-encoder's
+scores are used as a ranking and never as a threshold — they are comparable
+inside a single call and meaningless across calls, so nothing in the pipeline
+cuts on their value.
+
+Every sort is `(score desc, memory_id asc)`, including inside the SQL. Two runs
+of the same query over an unchanged database return the same rows in the same
+order, which is the property that makes a difference between two runs readable
+as a real effect.
+
+### Starting the runtime
+
+Retrieval owns the daemon's autostart, because it is the first caller that needs
+a vector and it already knows how to run without one. On a failed `/health` it
+spawns `bun runtime/serve.js` detached, polls for up to five seconds, and then
+goes on regardless.
+
+An attempt is stamped in `<db>.autostart` before the wait, and a second attempt
+inside 60 seconds spawns nothing and waits for nothing: it degrades straight
+away with `runtime: autostart attempted <N>s ago, not ready`. Without that, a
+wedged port costs a fresh detached process and the whole five-second window on
+every single search.
+
+**The honest bound is ensure + embed + rerank**, not "it never blocks". The
+runtime reports a load that has only *begun* as ready, so a call can still land
+on a server that is loading ONNX sessions; retrieval races every runtime call
+against `runtimeTimeoutMs` (default 5000 ms, `--runtime-timeout-ms` on the CLI)
+and treats an expiry as a degraded rung with its reason on the trace, never as
+an exception. Worst case for a prompt is the five-second start window plus one
+embed timeout plus one rerank timeout. A `{ db, client }` caller that builds its
+own client owns the client's own timeout as well.
+
+### Degradation
+
+Three rungs, and none of them is an empty result or an exception:
+
+| What failed | What comes back | `degraded` |
+| --- | --- | --- |
+| The runtime is down or the weights are missing | FTS5 only, merged and returned | `vector: unavailable` |
+| The reranker alone failed | The merged order, uncut | `rerank: unavailable` |
+| Both | FTS5 only, merge order | `vector: unavailable; rerank: unavailable` |
+| `/embed` did not answer inside the timeout | FTS5 only, merged and returned | `vector: unavailable` |
+| `/rerank` did not answer inside the timeout | The merged order, uncut | `rerank: unavailable` |
+
+A not-ready runtime short-circuits both arms: nothing is posted to `/rerank`
+after `ensureRuntime` has already said the daemon is not up, and both rungs
+carry that same reason.
+
+A query with nothing searchable in it ("ok", "thanks") returns nothing, makes no
+model call, and records the reason. That is a large share of real prompts and it
+is not a failure.
+
+### The CLIs
+
+```
+bun retrieval/search-cli.js <db> --project P --query "..." [--k 5]
+        [--types feedback,project] [--status active] [--since ISO] [--until ISO]
+        [--origin manual] [--no-runtime] [--with-id] [--runtime-timeout-ms 5000]
+bun retrieval/explain-cli.js <db> <retrievalId> [--json]
+```
+
+`search-cli` prints the results as JSON on stdout and the retrieval id on
+stderr, so two runs of the same query diff clean. `--no-runtime` skips the
+autostart, which is how the degraded path is exercised on purpose.
+
+`explain-cli` re-runs nothing. It reads the trace and renders it:
+
+```
+retrieval 2  2026-09-17T05:48:48.871Z  origin=manual  k=5
+query        (raw-prompt, 57 chars)
+             how do I stop the worktree gate from failing on ORAT-4417
+match        "stop" OR "worktree" OR "gate" OR "failing" OR "orat" OR "4417"
+filters      project=host/owner/alpha  status=active  types=(any)  since=-  until=-
+constants    rrf_k=60  arm_limit=30  rerank_cap=30
+counts       fts=2  vector=25  merged=25  reranked=25  returned=5  vectors_scanned=25
+timing       total=396ms  embed=55ms  fts=2ms  vector=5ms  rerank=312ms
+degraded     no
+
+candidates (25)
+final  merge#  memory  arms      fts#  fts score       vec#  vec score       merge score   rerank      title                             cut
+1      1       3       fts+vec   1     -22.2976        1     0.861477        0.0327869     2.25036     The worktree gate fails on ORAT-
+2      2       1       fts+vec   2     -8.26051        2     0.654703        0.0322581     0.105170    Ticket ORAT-4417
+3      14      13      vec       -     -               14    0.484519        0.0135135     -0.627677   The submodule pointer goes secon
+...
+-      3       11      vec       -     -               3     0.571734        0.0158730     -1.24505    Secrets live in one env file      below the top 5
+```
+
+A candidate only the vector arm found has no `fts#`; one only the lexical arm
+found has no `vec#`. The `cut` column is why a candidate is not in the answer,
+and a memory dropped by a caller's `--types` gets a row saying so rather than
+vanishing.
+
+### What the trace keeps in `retrievals.filters`
+
+`retrievals` has columns for the counts, the timings and the fact of a
+degradation, and none for the why. Until a ticket adds them, this JSON column
+carries the rest, and `explain` renders it:
+
+| Key | What it says |
+| --- | --- |
+| `project`, `status`, `types`, `since`, `until` | The metadata filter, as asked for |
+| `match_expression` | The FTS5 MATCH the query was turned into |
+| `query_chars`, `query_truncated`, `query_truncated_to` | The prompt's length, and where it was cut for the embedder |
+| `query_empty_reason` | Why a prompt had nothing searchable in it |
+| `rrf_k`, `arm_limit`, `rerank_cap`, `runtime_timeout_ms` | The constants that run was made under |
+| `vectors_scanned` | How many stored vectors the brute-force arm compared |
+| `vectors_skipped_dim` | Stored vectors skipped because their width is not the query's |
+| `vector_no_rows_for_model` | The model that answered, when the corpus has embeddings and none are its |
+| `vector_unavailable_reason`, `rerank_unavailable_reason` | Why each rung degraded |
+| `k_clamped_from` | The `k` that was asked for, when it exceeded the rerank cap |
+
+### A database to try it on
+
+```
+bun test/seed-retrieval.js /tmp/retrieval-fixture.db
+```
+
+~50 memories over two projects and all four types, embedded through the real
+runtime, plus four probes: a memory only the lexical arm can find, one only the
+vector arm can find, one both find, and the same strong match under the other
+project, which must never appear. It needs the weights; `bun test` does not.
+
+### Not handled here
+
+- **No recency or importance weighting.** The columns exist and using them in
+  the score is a change to make with a measurement behind it.
+- **No query expansion, no synonyms, no relevance feedback**, and no dedup of
+  near-identical memories.
+- **No tuning.** There is no labelled corpus, and a merge weight tuned by eye on
+  ten queries is worse than a principled default.
 
 ## Settings
 
@@ -678,14 +857,14 @@ the design lives. The SQLite schema with provenance and lifecycle is in, the
 graded generation prompt is in, and a compaction now writes memories. The local
 embedding model (`BAAI/bge-small-en-v1.5`) and reranker
 (`jinaai/jina-reranker-v1-tiny-en`) are in too, as the loopback daemon
-documented under Runtime, and nothing calls them yet. What is still missing: a
-hybrid FTS5 and vector retrieval pipeline with an inspectable trace, injection
-on `prompt.submit` and on no other kind of turn, a pane showing what this
-session was given, and the rest of the tools.
+documented under Runtime, and hybrid retrieval over both of them is in as a
+function and two CLIs. What is still missing: injection on `prompt.submit` and
+on no other kind of turn, a pane showing what this session was given, and the
+rest of the tools.
 
-Until those land the honest description is that this plugin writes memories down
-and never reads them back. Nothing retrieves, nothing is injected, and no
-session has ever been handed one of these rows.
+Until those land the honest description is that this plugin writes memories
+down, and reads them back only when you ask it to from a terminal. Nothing is
+injected, and no session has ever been handed one of these rows.
 
 ## Known limits
 
@@ -706,10 +885,10 @@ session has ever been handed one of these rows.
   see. The cost is one line of tool listing; the guard is the deny rule above.
 - Nothing prunes `~/.claude/memory-handoff/`. It grows by one row and one small
   JSON file per compaction, forever, until you delete it.
-- The runtime is 161.6 MB of weights you have to download yourself and a daemon
-  you have to start yourself. Until you do both, `/health` says so and every
-  call answers `{ ok: false, reason }`; nothing here starts it for you and
-  nothing here fails because it is absent.
+- The runtime is 161.6 MB of weights you have to download yourself. The daemon
+  starts itself when retrieval needs it; until the weights are there `/health`
+  says so, every call answers `{ ok: false, reason }`, and retrieval runs
+  lexical-only rather than failing.
 - A vector is only comparable with vectors from the same model, revision and
   dtype. `/health` reports all three so a stored vector can be attributed, but
   changing the model re-embeds nothing.
