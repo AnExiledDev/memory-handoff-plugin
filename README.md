@@ -161,10 +161,18 @@ work.
 A row carries when it ran, `via`, the session id, cwd, the compaction trigger,
 the model, the plugin and engine versions, how many messages the transcript
 held, the context the session reported, the fork's `usage`, how long it took in
-milliseconds, how many candidate memories parsed out, and where the reply went.
-Every one of those readings is allowed to fail on its own, so a field can be
-`null` and the row still gets written. Outcomes are `extracted`, `empty`,
-`cold`, `threw`, `rehearsed` and `subagent`.
+milliseconds, and where the reply went. What the reply came to is four fields:
+`parsedRows` and `rejectedRows` (with the first few `rejected` reasons beside
+them), `hitOutputCap`, and `memoriesWritten` with the `writeOutcome` the
+database writer returned. Every one of those readings is allowed to fail on its
+own, so a field can be `null` and the row still gets written. Outcomes are
+`extracted`, `empty`, `cold`, `threw`, `rehearsed`, `subagent` and
+`precompute`.
+
+The same compaction also writes `memory.sqlite`: one `generations` row, one
+`costs` row and one `memories` row per memory, in one transaction. The index
+row is the log and the database is the data, and they are written separately on
+purpose, because the row has to survive the database being unwritable.
 
 Durations are `Date.now()` everywhere, because `$.clock.now()` returns a Promise
 at 2.1.273 against a declaration saying it returns a number, and subtracting a
@@ -268,6 +276,141 @@ summary line printed. `bun test` is the gate. The DDL is written for SQLite
 tables, no `RETURNING` and no `->>` operator; it runs on the 3.53.0 inside
 `bun:sqlite` as well, on the same file.
 
+## Generation
+
+The prompt the fork is asked is `GENERATION_PROMPT` in `hooks/prompt.js`, and
+the same text is `bench/prompts/v2.txt`, which is the arm the numbers below were
+measured on. A test asserts the constant and the file are byte for byte equal,
+because a bench that grades a file while the hook forks a constant measures
+nothing.
+
+It asks for one block and nothing else, JSONL inside it, one object per line:
+
+```
+<memories>
+{"type":"project","title":"short noun phrase","body":"the fact, self-contained, and why it matters","importance":3}
+{"type":"feedback","title":"...","body":"...","importance":4,"supersedes_hint":"names an older memory this contradicts, in plain words"}
+</memories>
+```
+
+Four types and no others: `user`, `feedback`, `project`, `reference`. Each gets
+its own paragraph and any of them is allowed to come back empty, since most
+conversations establish one or two kinds of thing and a prompt that asks for
+four will otherwise get four. The write and never-write lists are auto-memory's
+own, quoted rather than paraphrased, with the never-write list stated to outrank
+the other one. Secrets get their own sentence: the memory names the file or the
+variable, never the value, because that is the one mistake here that cannot be
+undone. **An empty block is a correct answer** and the prompt says so, so that a
+session that established nothing durable is not pressured into inventing
+something.
+
+The budget is at most 25 memories, a title of at most 120 characters and a body
+of at most 600. Those are tighter than the schema's 200 and 4000 on purpose: the
+schema's caps are what a row may hold, and these are what is worth reading back
+into a later session's prompt.
+
+### What the parser does with the reply
+
+`parseReply(text)` in `hooks/parse.js` is total: it never throws, for any input
+including `null` and a number, and it is linear in the length of the reply. It
+answers `{ rows, rejected, hitCap, hadBlock }`.
+
+A line that breaks the contract is **rejected, never clipped**: an unknown
+`type`, an `importance` that is not a whole number from 1 to 5, a missing or
+empty `title` or `body`, a title or body over the budget, or a line that is not
+JSON at all. Each rejection is `{ line, reason }` with the line number inside
+the block, the count goes on the row as `rejectedRows`, and the first few
+reasons go with it. Keys the schema does not know are ignored rather than
+rejected, so a model that adds a field costs you nothing.
+`supersedes_hint` is optional, and only a string.
+
+A reply that was cut off mid-flight is reported rather than guessed at:
+`hitCap` is `"truncated row"` when the block never closed and the last line is
+unparseable, `"length"` when it never closed but every line in it was whole, and
+`null` otherwise. A reply carrying no block at all gives
+`rejected: [{ line: 0, reason: "no block" }]` and `hadBlock: false`.
+
+**There is no repair call.** A reply with no block is recorded as an `empty`
+generation and the fork is not asked again. A second fork is a second charge
+against a compaction that is already blocking the session, and the failure it
+would recover is rare enough that the honest record is worth more than the
+retry. `rejectedRows` on the rows is the measurement that would justify changing
+this.
+
+### The writer
+
+`schema/write-generation.js` is a Bun CLI. It reads one JSON document on stdin
+and writes, in one transaction, the memories, one `generations` row and one
+`costs` row, then prints `{ ok, memoriesWritten, ids, generationId, costId,
+project, projectKind }` or `{ ok: false, reason }`. It refuses rather than
+throws, and it exits 0 either way, because its caller is a compaction hook.
+
+The pure half is `schema/generation-rows.js`: the project key, and the shape of
+each of the three rows. Pricing comes from `hooks/pricing.js`, and an unknown
+model is `usd NULL` with a `cost_unknown_reason` rather than a silent zero; a
+genuine zero (the paths that spend nothing at all) is `usd 0` with a
+`cost_note` saying which path it was.
+
+The hook reaches it with `$.process.run(["bun", <writer>], { stdin, timeoutMs })`
+rather than by importing it, so the database driver is never loaded inside the
+engine's process and a writer that hangs costs a bounded 20 seconds. `git` is
+read the same way, with a 3 second ceiling, and a git that is slow or absent
+falls back to the toplevel and then to the cwd.
+
+Two paths spend nothing and still write a row saying so: a **subagent**
+compaction, which is a different conversation with a different owner, and a
+**precompute** compaction, which the engine may never use. Both are
+`generations.outcome = "skipped"` with the reason on the row. A null fork is
+`cold`, also with a `costs` row, so the cold forks stay countable.
+
+### The bench
+
+`bench/` grades an arm against a fixture, blind. The fixture is a synthetic
+transcript with a checklist beside it: 22 planted facts and 7 decoys (a branch
+name, a SHA, a next-step plan, a session-state line, an obviously fake token, a
+tool-invocation line, and a roadmap item). Replies are parsed by the plugin's
+own parser over `bun hooks/parse-cli.js`, never a second parser written in
+Python, and a grader model scores each atom `present` / `partial` / `absent` /
+`wrong` at 1.0 / 0.5 / 0.0 / -1.0, seeing the memories and the checklist and
+never the arm or the prompt. `wrong` is the hard one, and a `wrong` verdict that
+does not quote both the checklist and the memory is downgraded to `partial`.
+Decoys are counted by substring rather than by asking a model: a decoy either
+appears in the output or it does not.
+
+```
+PATH=~/.bun/bin:$PATH python3 bench/run.py --fixture ledgerctl --repeat 2 \
+    --arm v2 --model claude-opus-5 --grader claude-sonnet-5
+```
+
+Reports land in `bench/.runs/`, which is gitignored. Replicates run one at a
+time, deliberately: a 7.9 GB box running two headless Claudes at once is an OOM.
+
+**Measured 2026-09-17**, two replicates per arm, generation `claude-opus-5`,
+grading `claude-sonnet-5`, 22 atoms:
+
+| arm | recall mean | min | max | spread | decoys per replicate | memories | cost |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| v1 | 0.898 | 0.886 | 0.909 | 0.023 | 1, 1 | 23, 23 | $0.4894 |
+| **v2** | **0.966** | 0.932 | 1.000 | 0.068 | **0, 0** | 22, 22 | $0.4773 |
+
+v1 leaked the same decoy on both replicates: the fixture's "Kafka next quarter"
+roadmap item, written down as a constraint on how much to build now. The whole
+difference in v2 is two sentences in the never-write paragraph, naming a plan
+for a future quarter outright and saying that a roadmap arriving as a reason to
+do less work is still a roadmap. v2 ships.
+
+Read the numbers as a floor rather than a score. Two replicates cannot separate
+0.966 from 0.93, the recall spread is wider than the gap between the arms on
+their best replicates, and both of v1's `wrong` verdicts were grader pedantry
+over memories that were correct. Zero decoys is the bar that moved.
+
+**The fork's own output ceiling is not measured and cannot be, here.**
+`$.model.fork` is always null headless, so the bench drives `claude -p` over the
+transcript instead, which is the same prompt against the same model but not the
+same call. Whatever cap a real fork's reply has, it shows up on the rows as
+`hitOutputCap`, which is why the parser reports it instead of silently keeping
+what it got.
+
 ## Settings
 
 | Variable | Default | Effect |
@@ -296,29 +439,35 @@ explain, every one of them paired with a subagent compaction, and that is
 claude-investigations#690. The seam hands this plugin the same event, so it
 inherits the same problem, and recording the usage is how it stays visible.
 
-The row carries no dollar figure yet. compact-handoff prices its rows from a
-table it reads off Anthropic's pricing page and records the date it was read;
-this one records the tokens and leaves the arithmetic for later.
+The index row still carries tokens only; the dollars are in the database. Every
+generation writes a `costs` row priced by `hooks/pricing.js` from a table read
+off Anthropic's pricing page on 2026-09-14, on a subscription basis with cache
+reads waived, and the date and the basis go on the row beside the number. A
+model the table does not know is `usd NULL` with the reason, never a zero that
+sums as if the call were free.
 
 ## Roadmap
 
 This is the first slice of AnExiledDev/claude-investigations#678, which is where
-the design lives. The SQLite schema with provenance and lifecycle is in, and
-nothing writes to it yet. What is still missing: the writer that turns a fork's
-answer into rows, a written extraction prompt, a local embedding model
+the design lives. The SQLite schema with provenance and lifecycle is in, the
+graded generation prompt is in, and a compaction now writes memories. What is
+still missing: a local embedding model
 (`BAAI/bge-small-en-v1.5`) and reranker (`jinaai/jina-reranker-v1-tiny-en`), a
 hybrid FTS5 and vector retrieval pipeline with an inspectable trace, injection
 on `prompt.submit` and on no other kind of turn, a pane showing what this
 session was given, and the rest of the tools.
 
-Until those land the honest description is that this plugin measures a fork and
-stores its answer. It does not remember anything for you yet.
+Until those land the honest description is that this plugin writes memories down
+and never reads them back. Nothing retrieves, nothing is injected, and no
+session has ever been handed one of these rows.
 
 ## Known limits
 
-- The extraction prompt is a placeholder, it has never been graded against
-  anything, and what comes back is whatever the model felt like writing. Take
-  the JSON shape as a hint and not a contract.
+- The generation prompt is graded against one synthetic fixture, twice, on one
+  model. 0.966 recall and zero decoys is what that measured; it is not a claim
+  about your conversations, and half of what a fork carries is chance.
+- A reply with no `<memories>` block is recorded and dropped. Nothing asks
+  again, so a bad generation costs you that compaction's memories entirely.
 - `$.model.fork` is always null headless, the engine says so in its log, so
   under `claude -p` every row reads `cold` and nothing is extracted.
 - A session that started before compact-handoff loaded, or one where the seam
