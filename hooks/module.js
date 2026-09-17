@@ -121,7 +121,7 @@ const TOOL_DELETE = "mcp__memory-handoff__memory_delete";
 const DEFAULT_INJECT_K = 5;
 const DEFAULT_MAX_ENTRIES = 5;
 const DEFAULT_MAX_CHARS = 4000;
-const DEFAULT_INJECT_MS = 1500;
+const DEFAULT_INJECT_MS = 2500;
 const DEFAULT_BUDGET_USD = 1;
 
 /**
@@ -129,9 +129,13 @@ const DEFAULT_BUDGET_USD = 1;
  *
  * The outer `timeoutMs` is the hard bound on the whole child; the runtime wait
  * inside it has to end first, or the child is killed mid-degradation and the
- * `retrievals` row it was about to write is never written.
+ * `retrievals` row it was about to write is never written. Measured on
+ * 2026-09-17 against a cold daemon: the bun child itself costs ~330 ms before
+ * the wait starts, and a cold embed plus the rerank and the row is ~450 ms
+ * after it ends, so the margin covers that and the whole child fits inside
+ * `DEFAULT_INJECT_MS` (1650 ms cold, ~430 ms warm).
  */
-const RUNTIME_MARGIN_MS = 300;
+const RUNTIME_MARGIN_MS = 700;
 
 /** The least runtime wait worth asking for once the margin is taken off. */
 const RUNTIME_FLOOR_MS = 200;
@@ -587,6 +591,10 @@ const writeDocument = (record, rows, outcome, where, dbPath) => ({
         trigger: record.trigger,
         replyFile: record.replyFile,
     },
+    // The vectors are written behind the compaction, by a child the writer
+    // starts and does not wait for: a memory without one is found by FTS5
+    // alone until the runtime has embedded it.
+    embedAfter: true,
     rows,
     generation: {
         at: record.at,

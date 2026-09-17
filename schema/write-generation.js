@@ -24,9 +24,17 @@
  * - `usage`       the fork's `ModelForkUsage`, for pricing.
  * - `model`       the model the fork ran on.
  * - `costNote`    set instead of `usage` when no model call was made at all.
+ * - `embedAfter`  `true` to start `retrieval/embed-missing.js` detached once
+ *                 the rows are in, so the memories get vectors without the
+ *                 compaction waiting on the runtime. Off unless asked, so a
+ *                 test never starts a model server.
  */
 
-import { openMemoryDb, withRetry } from "./bun-sqlite.js";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { spawnDetached } from "../runtime/detach.js";
+import { defaultDbPath, openMemoryDb, withRetry } from "./bun-sqlite.js";
 import { costRow, generationRow, memoryRow, projectKey } from "./generation-rows.js";
 
 const MEMORY_COLUMNS = [
@@ -46,8 +54,27 @@ const MEMORY_COLUMNS = [
 const main = async () => {
     const doc = await readDocument();
     const answer = write(doc);
+    const embedSpawned = answer.ok === true && answer.memoriesWritten > 0 && doc.embedAfter === true && startEmbedding(doc.dbPath);
 
-    process.stdout.write(`${JSON.stringify(answer)}\n`);
+    process.stdout.write(`${JSON.stringify({ ...answer, embedSpawned })}\n`);
+};
+
+/**
+ * The vectors, behind the write and detached from it.
+ *
+ * @param {string | undefined} dbPath
+ * @returns {boolean} Whether the child started; a spawn that throws is not a reason to fail a write that has already landed.
+ */
+const startEmbedding = (dbPath) => {
+    const embedder = join(dirname(fileURLToPath(import.meta.url)), "..", "retrieval", "embed-missing.js");
+
+    try {
+        spawnDetached(["bun", embedder, dbPath ?? defaultDbPath()]);
+
+        return true;
+    } catch {
+        return false;
+    }
 };
 
 /** Everything on stdin, as a document, or a reason it is not one. */

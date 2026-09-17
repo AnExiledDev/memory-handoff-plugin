@@ -353,8 +353,22 @@ this.
 `schema/write-generation.js` is a Bun CLI. It reads one JSON document on stdin
 and writes, in one transaction, the memories, one `generations` row and one
 `costs` row, then prints `{ ok, memoriesWritten, ids, generationId, costId,
-project, projectKind }` or `{ ok: false, reason }`. It refuses rather than
-throws, and it exits 0 either way, because its caller is a compaction hook.
+project, projectKind, embedSpawned }` or `{ ok: false, reason }`. It refuses
+rather than throws, and it exits 0 either way, because its caller is a
+compaction hook.
+
+The vectors are not written here. When the document says `embedAfter: true`
+(the hook always does) and at least one memory landed, the writer starts
+`retrieval/embed-missing.js` detached and does not wait for it: that child
+brings the runtime up if it has to, embeds every active memory that has no
+vector yet, and exits. Until it has run the new memory is found by FTS5 alone;
+the compaction is never held on a model server coming up. Nothing waits on the
+child, so `embedSpawned` only says it was started. Run it by hand to catch up a
+database whose runtime was down:
+
+```sh
+bun retrieval/embed-missing.js ~/.claude/memory-handoff/memory.sqlite
+```
 
 The pure half is `schema/generation-rows.js`: the project key, and the shape of
 each of the three rows. Pricing comes from `hooks/pricing.js`, and an unknown
@@ -713,6 +727,13 @@ a vector and it already knows how to run without one. On a failed `/health` it
 spawns `bun runtime/serve.js` detached, polls for up to five seconds, and then
 goes on regardless.
 
+Detached means its own session: the spawn goes through `setsid` when the box
+has one (`runtime/detach.js`), and the daemon ignores SIGHUP. Without both, the
+daemon sat in the Claude Code session's process group and died with that
+session's terminal, so every session paid a cold start and a prompt-time
+retrieval never found a warm runtime (measured 2026-09-17: a daemon started
+under `script` was gone the moment the pty closed).
+
 An attempt is stamped in `<db>.autostart` before the wait, and a second attempt
 inside 60 seconds spawns nothing and waits for nothing: it degrades straight
 away with `runtime: autostart attempted <N>s ago, not ready`. Without that, a
@@ -896,7 +917,7 @@ many candidates did not fit.
 
 The retrieval runs as a Bun child (`retrieval/search-cli.js`, handed the prompt
 over stdin rather than on its argv, where `ps` would show it) bounded by
-`MEMORY_HANDOFF_INJECT_TIMEOUT_MS`, 1500 ms by default, and the embedding
+`MEMORY_HANDOFF_INJECT_TIMEOUT_MS`, 2500 ms by default, and the embedding
 runtime inside it is bounded lower still so it has time to write its own
 degraded row before it is killed. On a timeout, a non-zero exit or output that
 is not a document, **the prompt goes down with no memories and no delay beyond
@@ -969,7 +990,7 @@ same way an interactive one is.
 | `MEMORY_HANDOFF_INJECT_K` | `5` | How many memories a prompt's retrieval asks for. |
 | `MEMORY_HANDOFF_INJECT_MAX_ENTRIES` | `5` | How many may go into one injected block. |
 | `MEMORY_HANDOFF_INJECT_MAX_CHARS` | `4000` | How large one injected block may be. |
-| `MEMORY_HANDOFF_INJECT_TIMEOUT_MS` | `1500` | Hard bound on the retrieval child at prompt time. Past it the prompt goes down with no memories. |
+| `MEMORY_HANDOFF_INJECT_TIMEOUT_MS` | `2500` | Hard bound on the retrieval child at prompt time. Past it the prompt goes down with no memories. Measured 2026-09-17: ~430 ms warm, ~1650 ms when the child has to start the runtime. |
 
 The runtime's four variables are in its own section, under Runtime.
 

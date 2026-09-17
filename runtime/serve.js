@@ -155,6 +155,11 @@ const positive = (raw) => {
 };
 
 if (import.meta.main) {
+    // The daemon is started from inside a session and must outlive it. The
+    // hangup that closes that session's terminal is not a reason to stop;
+    // the idle timer is.
+    process.on("SIGHUP", () => {});
+
     const { url, runtime } = serve();
     const health = runtime.health();
 

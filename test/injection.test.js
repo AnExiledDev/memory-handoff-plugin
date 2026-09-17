@@ -229,7 +229,7 @@ describe("when the retrieval does not answer", () => {
     it("lets the prompt through and says why, when the child times out", async () => {
         const host = fakeApi({
             search: () => {
-                throw new Error("timed out after 1500ms");
+                throw new Error("timed out after 2500ms");
             },
         });
         const { next } = await submitted(host);
@@ -239,7 +239,7 @@ describe("when the retrieval does not answer", () => {
         assert.equal(row.retrievalId, null);
         assert.deepEqual(row.memoryIds, []);
         assert.equal(row.chars, 0);
-        assert.ok(row.failure.reason.includes("1500ms"));
+        assert.ok(row.failure.reason.includes("2500ms"));
         assert.equal(row.failure.query, promptInput().text);
         assert.equal(row.failure.origin, "prompt");
     });
@@ -255,14 +255,14 @@ describe("when the retrieval does not answer", () => {
     });
 
     it("bounds the child at the timeout the environment sets", async () => {
-        const host = fakeApi({ env: { MEMORY_HANDOFF_INJECT_TIMEOUT_MS: "900" } });
+        const host = fakeApi({ env: { MEMORY_HANDOFF_INJECT_TIMEOUT_MS: "1400" } });
 
         await submitted(host);
 
         const call = host.childrenOf("search").at(0);
 
-        assert.equal(call.timeoutMs, 900);
-        assert.equal(call.argv[call.argv.indexOf("--runtime-timeout-ms") + 1], "600");
+        assert.equal(call.timeoutMs, 1400);
+        assert.equal(call.argv[call.argv.indexOf("--runtime-timeout-ms") + 1], "700", "the margin for the bun start and the tail after the wait");
     });
 });
 

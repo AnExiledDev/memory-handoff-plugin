@@ -24,6 +24,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { spawnDetached } from "../runtime/detach.js";
 import { defaultDbPath } from "../schema/bun-sqlite.js";
 
 /** How long a start is given before retrieval goes on without it. */
@@ -123,22 +124,16 @@ export const ensureRuntime = async (options) => {
 /**
  * The detached start.
  *
- * stdio is ignored on all three descriptors and the handle is unref'd, so the
- * daemon outlives this process and nothing downstream inherits a pipe that
- * would keep an event loop alive. Its own logs go nowhere by design: `/health`
- * is the interface, and a daemon writing into a session's stdout would land in
- * the middle of a prompt.
+ * Own session, stdio ignored on all three descriptors, handle unref'd: the
+ * daemon outlives this process and the terminal this process ran under (see
+ * `runtime/detach.js` for why the session matters), and nothing downstream
+ * inherits a pipe that would keep an event loop alive. Its own logs go nowhere
+ * by design: `/health` is the interface, and a daemon writing into a session's
+ * stdout would land in the middle of a prompt.
  *
  * @returns {void}
  */
-export const spawnDaemon = () => {
-    const child = Bun.spawn(["bun", servePath()], {
-        stdio: ["ignore", "ignore", "ignore"],
-        env: process.env,
-    });
-
-    child.unref();
-};
+export const spawnDaemon = () => spawnDetached(["bun", servePath()]);
 
 /**
  * The cooldown stamp, read and written fail-soft.
