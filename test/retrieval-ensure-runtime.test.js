@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+import { createClient } from "../runtime/client.js";
 import { AUTOSTART_COOLDOWN_MS, ensureRuntime, READY_TIMEOUT_MS, servePath } from "../retrieval/ensure-runtime.js";
 
 /**
@@ -19,6 +20,24 @@ const fakeClient = (answers) => {
             return answers[Math.min(calls.length - 1, answers.length - 1)];
         },
     };
+};
+
+/**
+ * A `/health` over the real client, answering from a script of bodies. The
+ * client is in the loop on purpose: what retrieval polls is the daemon's JSON,
+ * so a loading answer has to survive the parse as well as the wait.
+ */
+const fakeFetchClient = (bodies) => {
+    const urls = [];
+    const fetchText = async (url) => {
+        urls.push(url);
+
+        const body = bodies[Math.min(urls.length - 1, bodies.length - 1)];
+
+        return { status: 200, ok: true, text: JSON.stringify(body) };
+    };
+
+    return { urls, client: createClient({ fetchText, port: 8799 }) };
 };
 
 /** A clock the test advances itself, one poll at a time. */
@@ -61,6 +80,23 @@ describe("the daemon is started by retrieval, and only when it has to be", () =>
 
         assert.deepEqual(result, { ready: true, started: true });
         assert.equal(spawns, 1, "one daemon, not one per poll");
+    });
+
+    // `loading` is not `down`. The daemon says so for as long as the ONNX
+    // sessions take, and bailing on the first `ready: false` would throw away
+    // the warm runtime this wait exists to get.
+    it("polls through a daemon that answers loading before it answers ready", async () => {
+        const loading = { ready: false, reason: "loading the models, both sessions are still coming up", models: [], rss_bytes: 0 };
+        const { urls, client } = fakeFetchClient([loading, loading, { ready: true, models: [], rss_bytes: 0 }]);
+        const clock = fakeClock(250);
+        let spawns = 0;
+
+        const result = await ensureRuntime({ client, spawn: () => { spawns += 1; }, ...clock, ...fakeStamp() });
+
+        assert.deepEqual(result, { ready: true, started: true });
+        assert.equal(urls.length, 3, "it asked again after each loading answer instead of giving up on the first one");
+        assert.equal(clock.now(), 500, "two polls, and it stopped the moment the load finished");
+        assert.equal(spawns, 1);
     });
 
     // The rule this whole module exists for: a slow model load must never hold

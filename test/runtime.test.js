@@ -2,13 +2,13 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { bunFetchText, createClient } from "../runtime/client.js";
-import { createRuntime, defaultModelsDir, missingWeights } from "../runtime/infer.js";
+import { createRuntime, defaultModelsDir, filesFor, missingWeights, MODELS } from "../runtime/infer.js";
 import { serve } from "../runtime/serve.js";
 
 const HERE = join(fileURLToPath(import.meta.url), "..");
@@ -69,6 +69,36 @@ describe("health answers before anything is loaded", () => {
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
+    });
+});
+
+describe("readiness is three states, and ready is the last of them", () => {
+    // The whole point of the gate: a caller that polls `/health` before calling
+    // `/embed` must not be told yes while the ONNX sessions are still being
+    // built, or it spends the load blocked inside the embed instead.
+    withWeights("says weights missing, then loading, then ready, in that order", async () => {
+        const empty = mkdtempSync(join(tmpdir(), "memory-handoff-noweights-"));
+
+        try {
+            assert.match(String(createRuntime({ modelsDir: empty }).health().reason), /weights missing/u);
+        } finally {
+            rmSync(empty, { recursive: true, force: true });
+        }
+
+        const runtime = createRuntime();
+
+        assert.equal(runtime.health().ready, false, "nothing is loaded until somebody asks");
+
+        const loading = runtime.load();
+        const during = runtime.health();
+
+        assert.equal(during.ready, false, "a load that has only begun is not ready");
+        assert.match(String(during.reason), /loading/u);
+
+        await loading;
+
+        assert.equal(runtime.health().ready, true);
+        assert.equal(runtime.health().reason, undefined);
     });
 });
 
@@ -255,6 +285,41 @@ describe("the daemon serves the same answers over loopback", () => {
             assert.equal(daemon.server.hostname, "127.0.0.1");
         } finally {
             daemon.stop();
+        }
+    });
+});
+
+describe("a load that rejected is not a verdict for the life of the process", () => {
+    // Weights that are present but unreadable: the files exist, so nothing
+    // reports them missing, and the load throws somewhere inside transformers.
+    it("reports the rejection and hands the next caller a fresh attempt", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "memory-handoff-badweights-"));
+
+        try {
+            for (const relative of [...filesFor(MODELS.embed, "fp32"), ...filesFor(MODELS.rerank, "q8")]) {
+                const path = join(dir, relative);
+
+                mkdirSync(dirname(path), { recursive: true });
+                writeFileSync(path, "not a model");
+            }
+
+            const runtime = createRuntime({ modelsDir: dir });
+            const first = runtime.load();
+
+            await assert.rejects(first);
+
+            const health = runtime.health();
+
+            assert.equal(health.ready, false);
+            assert.match(String(health.reason), /load failed/u);
+
+            const second = runtime.load();
+
+            assert.notEqual(second, first, "the rejected promise is dropped, so the next call retries the load");
+
+            await second.catch(() => {});
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
         }
     });
 });

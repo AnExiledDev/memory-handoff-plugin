@@ -126,8 +126,33 @@ export const createRuntime = (options = {}) => {
     /** @type {Promise<{ embed: any, rerank: any }> | null} */
     let loading = null;
 
+    /** Set when both sessions exist, which is the only thing `health()` may call ready. */
+    let loaded = false;
+
+    /** @type {string | null} Why the last load rejected, kept for `health()` after the promise is dropped. */
+    let failure = null;
+
     const load = () => {
-        loading ??= loadBoth({ modelsDir, device, embedDtype, rerankDtype, threads });
+        if (loading === null) {
+            failure = null;
+            loading = loadBoth({ modelsDir, device, embedDtype, rerankDtype, threads }).then(
+                (sessions) => {
+                    loaded = true;
+
+                    return sessions;
+                },
+                (error) => {
+                    // A rejected load is dropped rather than cached. Holding the
+                    // rejected promise would make one bad read of a weights file
+                    // permanent for the life of the daemon, and the daemon lives
+                    // for half an hour past the session that started it.
+                    loading = null;
+                    failure = error instanceof Error ? error.message : String(error);
+
+                    throw error;
+                },
+            );
+        }
 
         return loading;
     };
@@ -228,6 +253,10 @@ export const createRuntime = (options = {}) => {
          * Reachability and readiness in one reading, and never a throw: a
          * caller that gets `ready: false` degrades to FTS5-only retrieval.
          *
+         * `ready` means both sessions exist, not that a load was started. A
+         * caller polling this as a gate would otherwise be told yes for the
+         * whole of the load and then block inside `embed` for the same time.
+         *
          * @returns {{ ready: boolean, models: string[], rss_bytes: number, weights_bytes: number, models_dir: string, device: Device, dtypes: { embed: Dtype, rerank: Dtype }, reason?: string }}
          */
         health: () => {
@@ -245,8 +274,16 @@ export const createRuntime = (options = {}) => {
                 return { ready: false, ...base, reason: `weights missing (${missing.length} files): run bun runtime/install.js` };
             }
 
+            if (failure !== null) {
+                return { ready: false, ...base, reason: `the load failed and will be retried on the next call: ${failure}` };
+            }
+
             if (loading === null) {
                 return { ready: false, ...base, reason: "weights are on disk and no model is loaded yet" };
+            }
+
+            if (!loaded) {
+                return { ready: false, ...base, reason: "loading the models, both sessions are still coming up" };
             }
 
             return { ready: true, ...base };

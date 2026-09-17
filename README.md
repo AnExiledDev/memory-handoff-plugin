@@ -484,6 +484,15 @@ load finishes. Every request resets the idle timer, and when it expires the
 process exits 0 rather than sitting on 350 MB for a session that ended hours
 ago.
 
+**`ready: true` means both ONNX sessions exist**, not that a load was started.
+There are three readings and they arrive in this order: the weights are missing,
+the models are loading, the runtime is ready. A caller polling `/health` as a
+gate gets the loading one for the whole of the load, which on this box is about
+750 ms and longer under memory pressure, instead of being told yes and then
+blocking inside its own `/embed`. A load that fails is reported with its reason
+and then dropped, so the next call starts a fresh one rather than the daemon
+carrying the failure for the rest of its half hour.
+
 **With no weights it still starts.** `/health` answers
 `{ ready: false, reason: "weights missing (11 files): run bun runtime/install.js" }`
 and `/embed` and `/rerank` answer 503 with the same reason in the body. Nothing
@@ -740,9 +749,9 @@ away with `runtime: autostart attempted <N>s ago, not ready`. Without that, a
 wedged port costs a fresh detached process and the whole five-second window on
 every single search.
 
-**The honest bound is ensure + embed + rerank**, not "it never blocks". The
-runtime reports a load that has only *begun* as ready, so a call can still land
-on a server that is loading ONNX sessions; retrieval races every runtime call
+**The honest bound is ensure + embed + rerank**, not "it never blocks". The wait
+above ends when `/health` says ready, and a daemon that finishes loading just
+after the window still gets called, so retrieval races every runtime call
 against `runtimeTimeoutMs` (default 5000 ms, `--runtime-timeout-ms` on the CLI)
 and treats an expiry as a degraded rung with its reason on the trace, never as
 an exception. Worst case for a prompt is the five-second start window plus one
