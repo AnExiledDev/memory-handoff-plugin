@@ -1,3 +1,4 @@
+.claude/types/
 .runs/
 .verify/
 __pycache__/

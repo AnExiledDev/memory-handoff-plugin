@@ -1,0 +1,6 @@
+# `bun test` covers this plugin's own code and nothing else. Without this root the
+# run also picks up `engine-test/*.test.ts`, which import `claude-code/testing`, a
+# module only the Claude Code binary provides, and which `claude plugin test .` runs
+# instead.
+[test]
+root = "test"
