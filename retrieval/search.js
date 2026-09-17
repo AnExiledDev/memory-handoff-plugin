@@ -33,7 +33,7 @@
  * re-runs nothing.
  */
 
-import { buildMatch, truncateForEmbedding } from "./query.js";
+import { buildMatch, MAX_RERANK_QUERY_CHARS, truncateForEmbedding, truncateForRerank } from "./query.js";
 import { mergeArms, orderForReturn, rankArm, RRF_K } from "./merge.js";
 import { dot, embeddingCount, ftsHits, textOf, vectorRows, writeTrace } from "./store.js";
 
@@ -62,6 +62,10 @@ export const RERANK_CAP = 30;
  * tens of milliseconds and a 30-pair rerank in a few hundred. It is a ceiling on
  * a runtime that is loading, wedged, or answering something else entirely, and
  * it exists because the caller is a prompt on its way out.
+ *
+ * Inference is kept under it by bounding what the models see rather than by
+ * raising it: #711 cut the rerank query to `MAX_RERANK_QUERY_CHARS`, because a
+ * long paste was the one input whose rerank overran this ceiling every time.
  */
 export const RUNTIME_TIMEOUT_MS = 5000;
 
@@ -326,9 +330,15 @@ const rerankArm = async ({ deps, request, merged, runtime, timeoutMs, now, stage
 
     const text = textOf(deps.db, capped.map((candidate) => candidate.memoryId));
     const documents = capped.map((candidate) => documentFor(text.get(candidate.memoryId)));
+    const queryText = truncateForRerank(request.query);
+
+    // Recorded whichever way it went, like the embedder's own cut: "the
+    // reranker saw all of it" is a fact about this retrieval, not an absence.
+    notes.rerank_query_truncated = queryText.truncated;
+    notes.rerank_query_truncated_to = queryText.truncated ? queryText.text.length : null;
 
     const started = now();
-    const ranked = await withTimeout(() => deps.client.rerank(truncateForEmbedding(request.query).text, documents), timeoutMs, "the rerank");
+    const ranked = await withTimeout(() => deps.client.rerank(queryText.text, documents), timeoutMs, "the rerank");
 
     stages.rerank = now() - started;
 
@@ -565,6 +575,7 @@ const traceFilters = (filters, match, embedText, vectorsScanned, timeoutMs, note
     query_chars: embedText.chars,
     query_truncated: embedText.truncated,
     query_truncated_to: embedText.truncated ? embedText.text.length : null,
+    rerank_query_chars: MAX_RERANK_QUERY_CHARS,
     vectors_scanned: vectorsScanned,
     arm_limit: ARM_LIMIT,
     rerank_cap: RERANK_CAP,

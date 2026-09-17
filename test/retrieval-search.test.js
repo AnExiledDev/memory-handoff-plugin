@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { explain } from "../retrieval/explain.js";
+import { MAX_RERANK_QUERY_CHARS } from "../retrieval/query.js";
 import { DEFAULT_K, search } from "../retrieval/search.js";
 import { DEPENDENCY_MISSING_REASON } from "../runtime/infer.js";
 import { FAKE_EMBED_MODEL, fakeClient, insertEmbedding, insertMemory, withDb } from "./retrieval-fixtures.js";
@@ -585,6 +586,60 @@ describe("k beyond what the reranker sees", () => {
             assert.equal(JSON.parse(row.filters).k_clamped_from, 100);
             assert.ok(answer.results.length <= 30);
             assert.match(explain(db, answer.retrievalId).text, /k was 100, clamped to the rerank cap/u);
+        });
+    });
+});
+
+// #711: the reranker is a cross-encoder sharing one 512-token sequence between
+// the query and the memory, so a pasted log both cost more than the 5 s ceiling
+// a prompt gives one runtime call and crowded the memory out of the window.
+describe("a long prompt reaching the reranker", () => {
+    const paste = `${QUERY}\n${Array.from({ length: 400 }, (_unused, index) => `at frame${index} (/srv/app/file${index}.js:${index}:12)`).join("\n")}`;
+
+    it("cuts the query to the rerank window and records the cut", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const seen = [];
+            const answer = await search(
+                { query: paste, project: PROJECT },
+                { db, client: fakeClient({ queryVector: QUERY_VECTOR, rerank: (query, docs) => { seen.push(query); return docs.map((doc) => doc.length / 100); } }) },
+            );
+            const filters = JSON.parse(retrievalOf(db, answer.retrievalId).filters);
+
+            assert.equal(answer.ok, true);
+            assert.equal(seen[0].length, MAX_RERANK_QUERY_CHARS);
+            assert.equal(filters.rerank_query_truncated, true);
+            assert.equal(filters.rerank_query_truncated_to, MAX_RERANK_QUERY_CHARS);
+            assert.equal(filters.rerank_query_chars, MAX_RERANK_QUERY_CHARS);
+            assert.match(explain(db, answer.retrievalId).text, /the reranker saw the first 600 characters/u);
+        });
+    });
+
+    // The embedder's cut is the wider one and stays where it was; a prompt over
+    // one window and under the other must not be reported as over both.
+    it("is a different cut from the embedder's", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const answer = await search({ query: paste.slice(0, 1000), project: PROJECT }, { db, client: client() });
+            const filters = JSON.parse(retrievalOf(db, answer.retrievalId).filters);
+
+            assert.equal(filters.query_truncated, false);
+            assert.equal(filters.rerank_query_truncated, true);
+        });
+    });
+
+    it("leaves a short prompt alone and says the reranker saw all of it", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const answer = await run(db, {});
+            const filters = JSON.parse(retrievalOf(db, answer.retrievalId).filters);
+
+            assert.equal(filters.rerank_query_truncated, false);
+            assert.equal(filters.rerank_query_truncated_to, null);
+            assert.doesNotMatch(explain(db, answer.retrievalId).text, /the reranker saw the first/u);
         });
     });
 });

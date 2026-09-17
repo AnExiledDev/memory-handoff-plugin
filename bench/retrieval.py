@@ -19,10 +19,9 @@ Each arm's whole set is run twice and the two runs' stdout compared byte for
 byte, because determinism is a stated property of `search()` rather than an
 accident of the sort order. A hybrid run that came back `degraded` is reported
 as degraded and exits non-zero: FTS5 numbers printed under a hybrid heading
-would be the wrong measurement, quietly. One query carries `allow_degraded`
-because it degrades by design rather than by accident (a pasted log costs more
-rerank time than the shipped ceiling gives it); its degradation is printed,
-graded and excluded from that check, and nothing else's is.
+would be the wrong measurement, quietly. No query carries `allow_degraded`
+any more; the long paste did until #711 bounded the rerank query, and the flag
+is still honoured so a future query that degrades by design can say so.
 
 The corpus is synthetic: ~50 seeded memories over two projects, written to
 exercise the arms. It says nothing about real conversations.

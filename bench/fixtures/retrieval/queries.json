@@ -337,8 +337,7 @@
       "partial": ["Parallel checkouts trip the quality barrier", "The submodule pointer goes second", "Ticket ORAT-4417"],
       "must_not": [],
       "expect_truncated": true,
-      "allow_degraded": true,
-      "note": "Past the embedder's window, which is the prompt a person actually sends: the question first, then the paste. The trace must record the truncation and the result must still be graded. It is allowed to come back degraded: 30 rerank pairs against 2000 characters of query take longer than the 5000 ms ceiling a prompt gives one runtime call (measured 2026-09-17: 6.2 s degraded at the default, 9.1 s and no degradation at --runtime-timeout-ms 20000), so the reranker is lost on a pasted log and the merge order is what comes back."
+      "note": "Past the embedder's window, which is the prompt a person actually sends: the question first, then the paste. The trace must record the truncation and the result must still be graded. It must not come back degraded: #711 cut the rerank query to 600 characters, so 30 pairs now finish well inside the 5000 ms ceiling a prompt gives one runtime call (measured 2026-09-17: 6.6 s at 2000 characters of query, 1.3 s at 600)."
     },
     {
       "id": "cross-project-gate",
