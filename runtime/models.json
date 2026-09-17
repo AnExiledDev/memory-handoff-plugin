@@ -1,0 +1,35 @@
+{
+    "comment": "Every weight this runtime will ever load, pinned to a commit and a sha256. runtime/install.js is the only thing that writes these files and it refuses anything whose digest disagrees.",
+    "embed": {
+        "id": "BAAI/bge-small-en-v1.5",
+        "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+        "licence": "MIT",
+        "dim": 384,
+        "maxTokens": 512,
+        "queryPrefix": "Represent this sentence for searching relevant passages: ",
+        "shippedDtype": "fp32",
+        "files": [
+            { "path": "config.json", "bytes": 743, "sha256": "094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750" },
+            { "path": "tokenizer.json", "bytes": 711396, "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66" },
+            { "path": "tokenizer_config.json", "bytes": 366, "sha256": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3" },
+            { "path": "special_tokens_map.json", "bytes": 125, "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3" },
+            { "path": "vocab.txt", "bytes": 231508, "sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3" },
+            { "path": "onnx/model.onnx", "bytes": 133093490, "sha256": "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35", "dtype": "fp32" }
+        ]
+    },
+    "rerank": {
+        "id": "jinaai/jina-reranker-v1-tiny-en",
+        "revision": "aca45de6945b5dc6399abcd2a9c55ded5dc9111f",
+        "licence": "Apache-2.0",
+        "maxTokens": 512,
+        "shippedDtype": "q8",
+        "files": [
+            { "path": "config.json", "bytes": 1206, "sha256": "dc70646aa6c9e75e3c513cc9c037f35ad54308001c3961d45c0f69749bcfb022" },
+            { "path": "tokenizer.json", "bytes": 2030772, "sha256": "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902" },
+            { "path": "tokenizer_config.json", "bytes": 1215, "sha256": "d291c6652d96d56ffdbcf1ea19d9bae5ed79003f7648c627e725a619227ce8fa" },
+            { "path": "special_tokens_map.json", "bytes": 280, "sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f" },
+            { "path": "onnx/model.onnx", "bytes": 132350375, "sha256": "e0e743251c7566e2b1e4f5ad091c681a700d7d7a3d85541ea56ca3acf43d1afa", "dtype": "fp32" },
+            { "path": "onnx/model_quantized.onnx", "bytes": 33424854, "sha256": "5fa8508528828b4ad9bc97c97b6e020984e3b745fbcb53f0a907e68704f8a18a", "dtype": "q8" }
+        ]
+    }
+}

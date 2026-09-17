@@ -1,0 +1,8 @@
+{
+    "name": "memory-handoff-plugin",
+    "private": true,
+    "type": "module",
+    "dependencies": {
+        "@huggingface/transformers": "^3.7.6"
+    }
+}
