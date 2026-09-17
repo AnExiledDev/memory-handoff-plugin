@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { readFileSync } from "node:fs";
 
-import { SEAM_TOOL, compactInput, fakeApi, fakeRuntime, fakeSeam, forkReply, passThrough } from "./fixtures.js";
+import { SEAM_TOOL, coldForkReply, compactInput, fakeApi, fakeRuntime, fakeSeam, forkReply, passThrough } from "./fixtures.js";
 
 // `node --check` reads module.js as a script and never sees an `await` in a
 // non-async arrow, so importing it is the only cheap parse that matches how the
@@ -363,6 +363,76 @@ describe("a generation that fails costs a row and nothing else", () => {
         assert.equal(host.rowsIn("index.jsonl")[0].outcome, "cold");
     });
 
+    // A fork charged for half the context read something else, and its memories
+    // would be injected into every later prompt with nothing saying where they
+    // came from. The fork is paid for either way, so the row is priced on it.
+    it("refuses a fork charged for half the context, and writes no memories", async () => {
+        const host = fakeApi({ fork: async () => coldForkReply() });
+        const runtime = await started(host);
+        const next = passThrough();
+
+        await runtime.dispatch("session.compact", host.$, compactInput(), next);
+
+        const row = host.rowsIn("index.jsonl")[0];
+
+        assert.equal(row.outcome, "mismatch");
+        assert.deepEqual(row.forkInput, { sent: 24_000, cacheRead: 20_000, contextTokens: 48_000, matchesContext: false });
+        assert.match(row.detail, /24000 input tokens against a 48000 token context/u);
+        assert.equal(row.memoriesWritten, 0);
+        assert.equal(row.parsedRows, null);
+        // The reply is a summary of somebody else's conversation; it is not kept.
+        assert.equal(row.replyFile, null);
+        assert.equal(next.calls.length, 1);
+
+        const doc = host.writes[0];
+
+        assert.deepEqual(doc.rows, []);
+        // `generations.outcome` takes six strings and the CHECK refuses a
+        // seventh, so the refusal is a `failed` row whose reason names it.
+        assert.equal(doc.generation.outcome, "failed");
+        assert.match(doc.generation.outcomeReason, /^mismatch: the fork was charged for 24000/u);
+        // Spent tokens, so a priced cost row and not a "no model call" zero.
+        assert.equal(doc.usage.output_tokens, 120);
+        assert.equal(doc.costNote, null);
+    });
+
+    // An unknown is not a mismatch: with no context to compare against there is
+    // nothing to judge, and refusing here would throw away every headless run's
+    // memories on no evidence at all.
+    it("writes the memories when the session cannot say what it holds", async () => {
+        const host = fakeApi({
+            fork: async () => coldForkReply(),
+            session: {
+                usage: async () => {
+                    throw new Error("nothing answers here");
+                },
+            },
+        });
+        const runtime = await started(host);
+
+        await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());
+
+        const row = host.rowsIn("index.jsonl")[0];
+
+        assert.equal(row.outcome, "extracted");
+        assert.equal(row.forkInput.matchesContext, null);
+        assert.equal(row.forkInput.contextTokens, null);
+        assert.equal(row.memoriesWritten, 2);
+    });
+
+    it("keeps a warm fork's memories, and says on the row that it matched", async () => {
+        const host = fakeApi();
+        const runtime = await started(host);
+
+        await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());
+
+        const row = host.rowsIn("index.jsonl")[0];
+
+        assert.equal(row.outcome, "extracted");
+        assert.deepEqual(row.forkInput, { sent: 48_012, cacheRead: 48_000, contextTokens: 48_000, matchesContext: true });
+        assert.equal(row.memoriesWritten, 2);
+    });
+
     // The engine's own `$.clock.now()` answers a Promise, so a duration built
     // on it is NaN and serialises as null. Everything here is `Date.now()`.
     it("times itself even though the engine's clock answers a Promise", async () => {
@@ -426,7 +496,9 @@ describe("the row a compaction leaves behind", () => {
             fork: async () => {
                 forks += 1;
 
-                return { text: "I would rather not.", usage: {} };
+                // A warm usage, because a reply is only read for a block once
+                // the input says the fork read this conversation.
+                return { text: "I would rather not.", usage: forkReply().usage };
             },
         });
         const runtime = await started(host);

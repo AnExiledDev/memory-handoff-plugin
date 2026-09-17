@@ -168,8 +168,27 @@ them), `hitOutputCap`, and `memoriesWritten` with the `writeOutcome` the
 database writer returned. Every one of those readings is allowed to fail on its
 own, so a field can be `null` and the row still gets written. Outcomes are
 `extracted`, `empty`, `cold`, `threw`, `rehearsed`, `subagent` and
-`precompute`, and `overBudget` when the session has spent its generation
-ceiling.
+`precompute`, `overBudget` when the session has spent its generation ceiling,
+and `mismatch` when the fork did not read this conversation.
+
+That last one is `forkInput`, which every forked row carries and every row that
+never forked has as `null`: what the fork was charged to read against what the
+session holds, `{sent, cacheRead, contextTokens, matchesContext}`. `sent` is
+input plus cache read plus cache write, which is the whole conversation for a
+warm fork and a prefix for a cold one. `matchesContext` is `false` when `sent`
+falls more than a fifth short of `contextTokens`, `null` when either number is
+missing, because an unknown is not a mismatch. A fork that falls short answered
+over a transcript that is not this conversation (compact-handoff measured cold
+forks at 0.40 to 0.47 of their context and warm ones at 1.01 to 1.04, with
+nothing in between), and its reply reads like any other summary, so nothing but
+`forkInput` can tell. That reply is refused: the row records `mismatch` with the
+two numbers, no memories are written, the reply is not kept, and the tokens the
+fork already spent stay on the row and are priced, because they were spent
+either way. A memory from the wrong conversation would be injected into every
+later prompt with nothing saying where it came from.
+
+The one-fifth floor is compact-handoff's, copied rather than imported so each
+plugin works without the other. If it moves, it moves in both.
 
 The same compaction also writes `memory.sqlite`: one `generations` row, one
 `costs` row and one `memories` row per memory, in one transaction. The index
@@ -387,6 +406,12 @@ compaction, which is a different conversation with a different owner, and a
 **precompute** compaction, which the engine may never use. Both are
 `generations.outcome = "skipped"` with the reason on the row. A null fork is
 `cold`, also with a `costs` row, so the cold forks stay countable.
+
+A refused fork (`mismatch` above) is a `generations` row too, priced on the
+tokens it spent. Its `outcome` reads `failed`, because the column's CHECK takes
+six strings and widening it would mean rebuilding the table under every live
+database; `outcome_reason` begins `mismatch:` and names both token counts, which
+is what tells a refused fork from a throw.
 
 ### The bench
 

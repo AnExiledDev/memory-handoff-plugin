@@ -98,6 +98,23 @@ export const forkReply = (memories = 2) => ({
 });
 
 /**
+ * The same reply, from a fork charged for half the context: a cold one.
+ *
+ * The text is a well-formed answer on purpose. A cold fork's reply reads like
+ * any other summary, so the only thing that can tell is the usage, and a
+ * fixture that answered badly would pass for the wrong reason.
+ */
+export const coldForkReply = (memories = 2) => ({
+    ...forkReply(memories),
+    usage: {
+        input_tokens: 4_000,
+        cache_read_input_tokens: 20_000,
+        cache_creation_input_tokens: 0,
+        output_tokens: 120,
+    },
+});
+
+/**
  * `git` as the hook reads it: a remote and a toplevel, unless a test says the
  * checkout has neither.
  */
