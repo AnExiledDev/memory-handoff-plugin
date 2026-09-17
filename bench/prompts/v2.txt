@@ -1,0 +1,39 @@
+Read back over this conversation one more time. It is about to be compacted and most of it is about to be thrown away. Write down the things a future session working on this project would otherwise have to rediscover at model cost.
+
+A memory is a fact, not a narrative. Judge every candidate against these two lists, which are the rule this plugin exists to follow.
+
+Write:
+- A fact about this repo or operator that a fresh session would waste time rediscovering.
+- A build flag, harness quirk, environment limit, or non-obvious "why" not in git, an ADR, or a comment.
+- A standing operator preference or correction.
+
+Never write:
+- Policy, process, orchestration. Those are rules; they go in `~/.claude/rules/`.
+- Plans, roadmaps, "next action", session state, SHAs, branch names.
+- Anything git, the tracker, or `AGENTS.md` already holds.
+- Secrets. Name the path, never the value.
+
+The never-write list outranks the write list. A branch name, a commit SHA, what you were about to do next, which tests are currently failing, a plan for a future quarter, and anything you read out of an `AGENTS.md` or `CLAUDE.md` file are all worthless a week from now, and a database full of them is worse than an empty one. A roadmap is still a roadmap when it arrives as a reason to do less work now: write down the measured fact it rests on if there is one, and let the plan itself go. If a secret was pasted into this conversation, the memory names the file or the variable it lives in and never the value itself; quoting a token into a memory is the one mistake here that cannot be undone.
+
+Consider each of these four types in turn, and let a type be empty if this conversation established nothing of that kind. Most conversations fill one or two.
+
+`user` - who the person is, what they are responsible for, what they already know, and how that should change the way work is explained to them.
+
+`feedback` - a correction they gave you, or an approach they confirmed was right. Carry the reason they gave, so a later session can tell an edge case from the rule.
+
+`project` - a fact about this codebase or the work around it that is not derivable by reading the code: a constraint, a measured number, an environment limit, a why.
+
+`reference` - where information lives outside this repository: which tracker, which dashboard, which channel, and what it is good for.
+
+Answer with a single `<memories>` block and nothing else. One JSON object per line, no array, no code fence, no commentary before or after the block:
+
+<memories>
+{"type":"project","title":"short noun phrase","body":"the fact, self-contained, and why it matters","importance":3}
+{"type":"feedback","title":"...","body":"...","importance":4,"supersedes_hint":"names an older memory this contradicts, in plain words"}
+</memories>
+
+Every line carries `type` (one of `user`, `feedback`, `project`, `reference`), `title` (at most 120 characters), `body` (at most 600 characters, newlines escaped as \n) and `importance`, a whole number from 1 (mildly useful) to 5 (would cost an hour to rediscover). `supersedes_hint` is optional free text and is the only place to say that something you learned here replaces something stated earlier; you cannot look anything up, so name it in words and let the plugin resolve it.
+
+At most 25 memories. Fewer is better than padded: every row you write is read again in a later session's prompt, and a row that was not worth keeping costs that session tokens and attention. Write one line per fact rather than one line per topic, and make each body stand on its own, since the conversation it came from will be gone.
+
+Leave the block empty if nothing qualifies. A conversation that established nothing durable is a normal outcome and an empty block is the correct answer to it. Do not manufacture a memory to fill the block.

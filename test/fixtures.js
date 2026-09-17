@@ -75,15 +75,20 @@ export const compactInput = (extra = {}) => ({
     ...extra,
 });
 
-/** What a fork answers when the placeholder prompt is honoured. */
+/** What a fork answers when the generation prompt is honoured. */
 export const forkReply = (memories = 2) => ({
-    text: `{"memories":${JSON.stringify(
-        Array.from({ length: memories }, (_, index) => ({
-            text: `memory ${index}`,
-            type: "fact",
-            importance: 2,
-        })),
-    )}}`,
+    text: [
+        "<memories>",
+        ...Array.from({ length: memories }, (_, index) =>
+            JSON.stringify({
+                type: "project",
+                title: `memory ${index}`,
+                body: `the ${index}th thing this conversation established`,
+                importance: 2,
+            }),
+        ),
+        "</memories>",
+    ].join("\n"),
     usage: {
         input_tokens: 12,
         cache_read_input_tokens: 48_000,
@@ -91,6 +96,41 @@ export const forkReply = (memories = 2) => ({
         output_tokens: 120,
     },
 });
+
+/**
+ * `git` as the hook reads it: a remote and a toplevel, unless a test says the
+ * checkout has neither.
+ */
+const gitAnswer = (argv, git) => {
+    const wanted = argv.includes("--show-toplevel") ? git.toplevel ?? "/repo" : git.remoteUrl ?? "git@github.com:owner/repo.git";
+
+    return wanted === null ? { exitCode: 128, stdout: "", stderr: "not a git repository" } : { exitCode: 0, stdout: `${wanted}\n`, stderr: "" };
+};
+
+/** The Bun writer: remembers the document it was handed and answers as it does. */
+const writerAnswer = (writes, stdin, override) => {
+    const doc = JSON.parse(stdin);
+
+    writes.push(doc);
+
+    if (override !== undefined) {
+        return override;
+    }
+
+    return {
+        exitCode: 0,
+        stdout: `${JSON.stringify({
+            ok: true,
+            memoriesWritten: doc.rows.length,
+            ids: doc.rows.map((_, index) => index + 1),
+            generationId: writes.length,
+            costId: writes.length,
+            project: "github.com/owner/repo",
+            projectKind: "remote",
+        })}\n`,
+        stderr: "",
+    };
+};
 
 /** The tool compact-handoff raises, and the whole of the seam between them. */
 export const SEAM_TOOL = "mcp__memory-handoff__before_compact";
@@ -145,6 +185,7 @@ export const fakeApi = (overrides = {}) => {
     const store = new Map();
     const env = { HOME: "/home/nobody", MEMORY_HANDOFF_LIVE: "1", ...overrides.env };
     const appends = [];
+    const writes = [];
     const tools = [];
 
     files.set("/plugin/.claude-plugin/plugin.json", JSON.stringify({ version: "0.1.0-test" }));
@@ -169,13 +210,22 @@ export const fakeApi = (overrides = {}) => {
             exists: async (path) => files.has(path),
             list: async () => [],
         },
-        // `appendRow` is the only caller, as
-        // `sh -c '... "$1"' memory-handoff <file>` with the row on stdin.
+        // Three callers, told apart the way the shell would: `sh -c` appending a
+        // row, `git` answering where the checkout is, and the Bun writer taking
+        // a whole generation on stdin and answering JSON on stdout.
         process: {
             run: async (argv, options = {}) => {
+                if (argv[0] === "git") {
+                    return gitAnswer(argv, overrides.git ?? {});
+                }
+
+                if (String(argv.at(-1)).endsWith("write-generation.js")) {
+                    return writerAnswer(writes, options.stdin ?? "", overrides.write);
+                }
+
                 appends.push({ file: argv.at(-1), line: (options.stdin ?? "").trimEnd() });
 
-                return { code: 0, stdout: "", stderr: "" };
+                return { exitCode: 0, stdout: "", stderr: "" };
             },
         },
         model: {
@@ -204,6 +254,8 @@ export const fakeApi = (overrides = {}) => {
         store,
         tools,
         appends,
+        /** Every generation document handed to the writer, parsed. */
+        writes,
         /** Every row appended to a log whose path ends in `name`, parsed. */
         rowsIn: (name) => appends.filter((entry) => entry.file.endsWith(name)).map((entry) => JSON.parse(entry.line)),
     };
