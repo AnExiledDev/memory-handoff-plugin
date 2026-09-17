@@ -8,14 +8,14 @@ away, and everything the session learned about your project goes with it. The
 next session rediscovers it at model cost. This plugin reads the conversation
 one more time on its way out and writes down what looked worth keeping.
 
-This is version 0.1.0 and it is the skeleton. It forks the session at
+This is version 0.2.0 and it is still the skeleton. It forks the session at
 compaction, asks the fork for a short list of candidate memories, and writes the
-answer and what it cost to a JSONL log under `~/.claude/memory-handoff/`. That
-is all it does. There is no database, no search, no reranker, nothing injected
-back into a later prompt, and the extraction question is a placeholder that will
-be replaced by a written and measured one. So right now it is an instrument
-rather than a memory, and the things that make it a memory are listed under
-Roadmap.
+answer and what it cost to a JSONL log under `~/.claude/memory-handoff/`. There
+is a database now, described under Storage, and nothing writes memories into it
+yet. There is no search, no reranker, nothing injected back into a later prompt,
+and the extraction question is a placeholder that will be replaced by a written
+and measured one. So right now it is an instrument rather than a memory, and the
+things that make it a memory are listed under Roadmap.
 
 It never answers a compaction. Every `session.compact` dispatch ends in
 `next(e)`, so your compaction is whatever it already was, plus a row.
@@ -182,6 +182,92 @@ engine built the raise out of and whether it filled in a `tool_use_id`. That is
 there to answer what a plugin's `$.tool.call` looks like beside the model's own
 call, which the declarations leave open.
 
+## Storage
+
+The database is `~/.claude/memory-handoff/memory.sqlite`, or `memory.sqlite`
+inside whatever `MEMORY_HANDOFF_DIR` points at. It sits outside any repository
+for the same reason the rows do: the plugin's own root is a worktree somebody
+may delete. It is opened in WAL mode with `foreign_keys` on and a 5000 ms busy
+timeout, because two sessions can compact in the same minute and both of them
+have to be able to write.
+
+The schema is `schema/001-initial.sql` and nine tables:
+
+- `schema_meta`, one row, the schema version the file is at.
+- `memories`, the memories themselves and the metadata every filter reads.
+- `memories_fts`, an FTS5 index over `title` and `body` only, external content
+  over `memories`, kept in step by three triggers. The documented query shape
+  weights the title: `bm25(memories_fts, 3.0, 1.0)`.
+- `embeddings`, one vector per memory per model, keyed on both.
+- `generations`, one row per attempt to turn a compaction into memories,
+  including the attempts that wrote nothing.
+- `costs`, what a model call cost, normalised into columns so a status command
+  can sum a day of them.
+- `retrievals`, one row per retrieval with its counts and its timings.
+- `retrieval_candidates`, every candidate a retrieval considered, including the
+  ones it threw away and why.
+- `injections`, what was actually put in front of the model, and what was
+  dropped or clipped to fit.
+
+**The project key is the git remote URL, normalised.** `git@host:owner/repo.git`
+and `https://host/owner/repo(.git)` both become `host/owner/repo`, lowercase
+host, no trailing `.git`. When there is no remote the key is the git toplevel
+path, and when there is no repository at all it is the cwd. A worktree under
+`.claude/worktrees/x` shares `origin` with its primary and so shares the key,
+which is the point: one repository is one project however many worktrees of it
+you have open. The raw `cwd` and which of the three answered (`project_kind` of
+`remote`, `toplevel` or `cwd`) go in the `source` JSON, never in the key. The
+empty string is refused by a CHECK, so a future global scope has to be a
+deliberate schema bump rather than a writer with an unset variable.
+
+**Importance is an integer 1 to 5**, CHECK enforced. A model can emit it
+reproducibly and a filter can ask for `>= 4`.
+
+**A title is at most 200 characters and a body at most 4000**, also CHECKs. The
+writer clips before it inserts and records the original length inside `source`
+as `{"clipped": {"body": 6100}}`, so a memory that was cut says so rather than
+looking like a short one. An unbounded blob is a thing the reranker would have
+to read later.
+
+**Deleting is a tombstone by default.** The row's `status` becomes `deleted`,
+the text stays, and the status filter stops returning it, because a memory you
+disagree with is evidence. `purge: true` is a real `DELETE`: it cascades to
+`embeddings` and `retrieval_candidates`, takes the FTS entry with it, and leaves
+`retrievals` and `injections` alone, since those hold ids and scores and no
+text. A memory that captured a secret has to actually go.
+
+**A memory is immutable once written**, except for `status`, `updated_at` and
+`supersedes`. That is a trigger rather than a convention, so index drift through
+an `UPDATE` that bypasses the FTS triggers cannot happen. An update is an insert
+plus a supersede instead: the successor carries `supersedes`, the ancestor's
+status becomes `superseded`, and a unique partial index makes a second successor
+for one ancestor impossible. A `rebuild` is still shipped for a database
+restored from a backup, `INSERT INTO memories_fts(memories_fts)
+VALUES('rebuild')`, exposed as `rebuildFts` in `schema/bun-sqlite.js`.
+
+**Vectors are plain blobs and the scan is brute force.** 384 float32 is 1536
+bytes a memory, so 20,000 memories is 30.7 MB resident and a full scan of that
+many dot products is single-digit milliseconds. 20,000 is the number at which
+`sqlite-vec` and a `vec0` table become the answer; `dtype` keeps `i8` as the
+cheaper lever before that, at 384 bytes a memory. A public plugin cannot ship or
+locate a loadable extension per platform, which is the other half of why the
+dependency is not here yet.
+
+**Migrations are forward-only.** `schema_meta.version` says where a database is,
+`schema/migrate.js` applies every `NNN-*.sql` above it in one transaction each,
+and a database at a version newer than the newest file on disk is refused rather
+than downgraded. `migrate.js` takes a port, `{ run(sql), get(sql) }`, and knows
+about no driver and no filesystem; `schema/bun-sqlite.js` is the one adapter and
+holds all of both.
+
+`bun schema/smoke.js [path]` is the runnable check: a fresh file, two memories,
+an FTS5 match, both vector dtypes, a supersede, a generation with its cost, a
+retrieval with three candidates and an injection, every count asserted and a
+summary line printed. `bun test` is the gate. The DDL is written for SQLite
+**3.37.2**, which is the oldest build it is expected to meet, so no `STRICT`
+tables, no `RETURNING` and no `->>` operator; it runs on the 3.53.0 inside
+`bun:sqlite` as well, on the same file.
+
 ## Settings
 
 | Variable | Default | Effect |
@@ -217,8 +303,9 @@ this one records the tokens and leaves the arithmetic for later.
 ## Roadmap
 
 This is the first slice of AnExiledDev/claude-investigations#678, which is where
-the design lives. What is still missing: the SQLite schema with provenance and
-lifecycle, a written extraction prompt, a local embedding model
+the design lives. The SQLite schema with provenance and lifecycle is in, and
+nothing writes to it yet. What is still missing: the writer that turns a fork's
+answer into rows, a written extraction prompt, a local embedding model
 (`BAAI/bge-small-en-v1.5`) and reranker (`jinaai/jina-reranker-v1-tiny-en`), a
 hybrid FTS5 and vector retrieval pipeline with an inspectable trace, injection
 on `prompt.submit` and on no other kind of turn, a pane showing what this
