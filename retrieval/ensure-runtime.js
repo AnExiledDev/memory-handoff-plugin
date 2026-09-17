@@ -71,9 +71,11 @@ export const ensureRuntime = async (options) => {
         return { ready: true, started: false };
     }
 
-    // Weights that are not on disk are not something a restart fixes, and
-    // spawning a daemon to watch it say so again is a wasted process.
-    if (/weights missing/iu.test(first.reason ?? "")) {
+    // Weights that are not on disk and a dependency that was never installed
+    // are not things a restart fixes, and spawning a daemon to watch it say so
+    // again is a wasted process. Both reasons carry the install command, so the
+    // retrieval row tells somebody what to run.
+    if (/weights missing|dependencies missing/iu.test(first.reason ?? "")) {
         return { ready: false, started: false, reason: first.reason ?? "weights missing" };
     }
 

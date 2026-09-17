@@ -8,7 +8,16 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { bunFetchText, createClient } from "../runtime/client.js";
-import { createRuntime, defaultModelsDir, filesFor, missingWeights, MODELS } from "../runtime/infer.js";
+import {
+    createRuntime,
+    defaultModelsDir,
+    dependencyInstalled,
+    DEPENDENCY_MISSING_REASON,
+    filesFor,
+    missingWeights,
+    MODELS,
+    RUNTIME_DEPENDENCY,
+} from "../runtime/infer.js";
 import { serve } from "../runtime/serve.js";
 
 const HERE = join(fileURLToPath(import.meta.url), "..");
@@ -28,6 +37,11 @@ const withWeights = MISSING.length === 0 ? it : it.skip;
 if (MISSING.length > 0) {
     console.warn(`memory-handoff: skipping the inference tests, ${MISSING.length} weight files are missing. Run: bun runtime/install.js`);
 }
+
+/** What resolution does on a copy that has never been installed. @returns {never} */
+const absent = () => {
+    throw new Error(`Cannot find module '${RUNTIME_DEPENDENCY}'`);
+};
 
 /** One embedding from a process of its own. @param {string} text @param {"query" | "document"} kind */
 const embedInChild = (text, kind) => {
@@ -69,6 +83,49 @@ describe("health answers before anything is loaded", () => {
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
+    });
+});
+
+describe("a copy with no dependencies answers, it does not die", () => {
+    // `claude plugin install` copies this directory and runs nothing, so the
+    // engine is absent until somebody runs the install step. A static import
+    // would take the daemon down before it could listen, and every caller would
+    // read that as a timeout with no cause attached.
+    it("names the missing dependency and the command that installs it", () => {
+        const dir = mkdtempSync(join(tmpdir(), "memory-handoff-nodeps-"));
+
+        try {
+            const health = createRuntime({ modelsDir: dir, resolveDependency: absent }).health();
+
+            assert.equal(health.ready, false);
+            assert.equal(health.reason, DEPENDENCY_MISSING_REASON);
+            assert.match(String(health.reason), /@huggingface\/transformers/u);
+            assert.match(String(health.reason), /bun runtime\/install\.js/u);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    // Both halves come from one command, and the engine is the half nothing can
+    // work around: weights with nothing to load them are 166 MB of nothing. So
+    // a machine missing both is told about the engine.
+    it("falls through to the weights once the engine resolves", () => {
+        const dir = mkdtempSync(join(tmpdir(), "memory-handoff-nodeps-"));
+
+        try {
+            const health = createRuntime({ modelsDir: dir, resolveDependency: (specifier) => specifier }).health();
+
+            assert.equal(health.ready, false);
+            assert.match(String(health.reason), /weights missing/u);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("decides by resolving the specifier, and never by importing it", () => {
+        assert.equal(dependencyInstalled(absent), false);
+        assert.equal(dependencyInstalled((specifier) => specifier), true);
+        assert.equal(RUNTIME_DEPENDENCY, "@huggingface/transformers");
     });
 });
 

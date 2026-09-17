@@ -125,6 +125,22 @@ describe("the daemon is started by retrieval, and only when it has to be", () =>
         assert.deepEqual(result, { ready: false, started: false, reason: "weights missing: bge-small-en-v1.5" });
     });
 
+    // Same install-time fact, same reasoning: a copy with no `node_modules` is
+    // not something a fresh process finds, and the reason already carries the
+    // command that fixes it.
+    it("refuses to spawn when the engine was never installed", async () => {
+        const client = fakeClient([
+            { ready: false, reason: "dependencies missing (@huggingface/transformers): run bun runtime/install.js" },
+        ]);
+        let spawns = 0;
+
+        const result = await ensureRuntime({ client, spawn: () => { spawns += 1; } });
+
+        assert.equal(spawns, 0);
+        assert.equal(result.ready, false);
+        assert.match(String(result.reason), /dependencies missing \(@huggingface\/transformers\): run bun runtime\/install\.js/u);
+    });
+
     it("turns a failed spawn into a reason rather than throwing at the caller", async () => {
         const client = fakeClient([{ ready: false, reason: "connect failed" }]);
 

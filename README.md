@@ -35,6 +35,38 @@ user scope unless you pass `--scope project` or `--scope local`. Claude Code
 picks it up on its next launch, or on `/reload-plugins` in a session that is
 already open.
 
+Then one command, in the directory the install copied:
+
+```bash
+cd ~/.claude/plugins/cache/memory-handoff/memory-handoff/*/
+bun runtime/install.js
+```
+
+That is the whole of the manual part. `claude plugin install` copies files and
+runs nothing, so a fresh copy has no `node_modules` and no model weights, and
+this one command installs both: the plugin's single runtime dependency into the
+directory it is run from, then the 161.6 MB of weights into
+`~/.claude/memory-handoff/models/`, both described under Runtime.
+A second run is a no-op for both halves and costs a sha256 of what is already
+there.
+
+**Without it the plugin still works and retrieval is worse.** Every compaction
+writes its memories with no vector, and every prompt retrieves on the lexical
+arm alone with `vector: unavailable` and the reason on the row; nothing throws
+and nothing is lost. When you do run it, `retrieval/embed-missing.js` is started
+after the next write and fills in the vectors for everything written while the
+dependency or the weights were absent, so the memories from before the install
+come back into the vector arm on their own.
+
+**`claude plugin update` produces a new directory**, `.../memory-handoff/<new
+version>/`, with no `node_modules` of its own, so the command above is needed
+again after every update. The weights are outside the plugin and survive it.
+
+The daemon's port is the other thing shared across copies: 8794 is one port on
+this machine, so a session running an installed copy that does have dependencies
+answers `/health` for every other copy on the box, and a copy of your own with
+no `node_modules` will look healthy for exactly as long as that daemon lives.
+
 Two environment variables belong in the `env` block of
 `~/.claude/settings.json`, and the install does not write them for you:
 
@@ -59,6 +91,7 @@ and takes precedence over the installed copy of the same name:
 
 ```bash
 git clone https://github.com/AnExiledDev/memory-handoff-plugin.git
+(cd memory-handoff-plugin && bun runtime/install.js)
 CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 MEMORY_HANDOFF_LIVE=1 claude --plugin-dir ./memory-handoff-plugin
 ```
 
@@ -491,22 +524,34 @@ this machine, on the CPU, out of a loopback daemon.
 | Reranker | `jinaai/jina-reranker-v1-tiny-en` @ `aca45de6945b`, int8, Apache-2.0 |
 | Engine | `@huggingface/transformers` 3.8.1 on onnxruntime-node, under Bun |
 
-### Install the weights, once
+### Install the dependencies and the weights, once
 
 ```
 bun runtime/install.js
 ```
 
-It downloads six files for the embedder and five for the reranker into
-`~/.claude/memory-handoff/models/`, verifies every one against a sha256 pinned
-in `runtime/models.json`, and prints what it wrote. **161.6 MB on disk** for the
-two shipped dtypes (127.8 MB bge fp32, 33.8 MB jina int8); `--all-dtypes` also
-fetches the fp32 reranker, which is only there so the quantisation comparison
-below can be reproduced. A file whose digest does not match is never written.
+Two halves, in this order, and both of them are things a fresh copy of the
+plugin does not have.
+
+**The dependencies.** `bun install --production --frozen-lockfile` in the
+directory this file lives in, which is the copy the daemon will be started from
+and not whatever the cwd happens to be. One package and its tree,
+`@huggingface/transformers`, from the committed `bun.lock`. Already installed is
+a no-op, so this half needs the network exactly once per copy. When it fails it
+says so, names itself as the half that failed, and stops: weights with no engine
+to load them are 166 MB of nothing.
+
+**The weights.** Six files for the embedder and five for the reranker into
+`~/.claude/memory-handoff/models/`, every one verified against a sha256 pinned
+in `runtime/models.json`, and it prints what it wrote. **161.6 MB on disk** for
+the two shipped dtypes (127.8 MB bge fp32, 33.8 MB jina int8); `--all-dtypes`
+also fetches the fp32 reranker, which is only there so the quantisation
+comparison below can be reproduced. A file whose digest does not match is never
+written.
 
 It is a command and refuses to be imported. A hook must never be the thing that
-decides to pull 160 MB off the internet, so the guard is a throw at module
-scope, not a flag somebody can pass.
+decides to run an installer or to pull 160 MB off the internet, so the guard is
+a throw at module scope, not a flag somebody can pass.
 
 ### Start and stop
 
@@ -527,8 +572,8 @@ process exits 0 rather than sitting on 350 MB for a session that ended hours
 ago.
 
 **`ready: true` means both ONNX sessions exist**, not that a load was started.
-There are three readings and they arrive in this order: the weights are missing,
-the models are loading, the runtime is ready. A caller polling `/health` as a
+There are four readings and they arrive in this order: the dependencies are
+missing, the weights are missing, the models are loading, the runtime is ready. A caller polling `/health` as a
 gate gets the loading one for the whole of the load, which on this box is about
 750 ms and longer under memory pressure, instead of being told yes and then
 blocking inside its own `/embed`. A load that fails is reported with its reason
@@ -540,6 +585,15 @@ carrying the failure for the rest of its half hour.
 and `/embed` and `/rerank` answer 503 with the same reason in the body. Nothing
 throws, at any layer, which is the point: retrieval that cannot embed falls back
 to FTS5 and the session never sees an error.
+
+**With no `node_modules` it still starts**, for the same reason and by the same
+route: `@huggingface/transformers` is imported inside the model load rather than
+at the top of `runtime/infer.js`, so a copy that has never had the install step
+run listens, answers
+`{ ready: false, reason: "dependencies missing (@huggingface/transformers): run bun runtime/install.js" }`,
+and degrades. A static import would have taken the daemon down before the
+listen, and everything upstream would have read that as a timeout with no cause
+attached to it.
 
 ### The interface
 
@@ -792,6 +846,10 @@ away with `runtime: autostart attempted <N>s ago, not ready`. Without that, a
 wedged port costs a fresh detached process and the whole five-second window on
 every single search.
 
+A `/health` that says the weights or the dependencies are missing spawns nothing
+at all and waits for nothing. Neither is a fact a fresh process changes, and
+both reasons already carry the command that does.
+
 **The honest bound is ensure + embed + rerank**, not "it never blocks". The wait
 above ends when `/health` says ready, and a daemon that finishes loading just
 after the window still gets called, so retrieval races every runtime call
@@ -808,6 +866,7 @@ Three rungs, and none of them is an empty result or an exception:
 | What failed | What comes back | `degraded` |
 | --- | --- | --- |
 | The runtime is down or the weights are missing | FTS5 only, merged and returned | `vector: unavailable` |
+| The copy has no `node_modules` | FTS5 only, merged and returned, `vector_unavailable_reason` naming `@huggingface/transformers` and the install command | `vector: unavailable` |
 | The reranker alone failed | The merged order, uncut | `rerank: unavailable` |
 | Both | FTS5 only, merge order | `vector: unavailable; rerank: unavailable` |
 | `/embed` did not answer inside the timeout | FTS5 only, merged and returned | `vector: unavailable` |

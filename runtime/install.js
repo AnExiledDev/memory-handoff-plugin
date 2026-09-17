@@ -1,39 +1,53 @@
 /**
  * The install step: `bun runtime/install.js`.
  *
- * 166 MB of weights are not in this repository and are never fetched by a
- * hook. A multi-hundred-megabyte download inside a compaction is not something
- * anybody consented to, so this is a command a person runs, once, and until
- * they have run it the runtime answers `ready: false` and retrieval degrades.
+ * Two halves, dependencies then weights, and neither of them is ever run by a
+ * hook. A marketplace install copies this directory and runs nothing, so the
+ * `node_modules` the runtime imports is absent; 166 MB of weights are not in
+ * this repository either. Downloading either one inside a compaction is not
+ * something anybody consented to, so this is a command a person runs, once, and
+ * until they have run it the runtime answers `ready: false` and retrieval
+ * degrades to FTS5-only.
  *
  * That "never from a hook" is enforced rather than documented: importing this
- * file throws, so the only way to reach the download is to run it.
+ * file throws, so the only way to reach either download is to run it.
  *
- * Every file is pinned by commit and by sha256 in `models.json`. A digest that
- * disagrees is a failure, not a warning: these files are executed as a model
- * graph and the repository they come from is not ours.
+ * The halves are ordered and the order is load-bearing. Weights with no engine
+ * to load them are 166 MB of nothing, so a failed `bun install` stops the run
+ * and says which half failed rather than leaving somebody with a full models
+ * directory and a runtime that still cannot come up.
+ *
+ * Every weight file is pinned by commit and by sha256 in `models.json`. A
+ * digest that disagrees is a failure, not a warning: these files are executed
+ * as a model graph and the repository they come from is not ours.
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { MODELS, defaultModelsDir, filesFor } from "./infer.js";
+import { MODELS, RUNTIME_DEPENDENCY, defaultModelsDir, filesFor } from "./infer.js";
 
 if (!import.meta.main) {
     throw new Error(
-        "memory-handoff: runtime/install.js is a command, not a module. Weights are downloaded out of band, never from a hook.",
+        "memory-handoff: runtime/install.js is a command, not a module. Dependencies and weights are installed out of band, never from a hook.",
     );
 }
 
 const HUB = "https://huggingface.co";
+
+/** The plugin directory, taken from this file rather than from the cwd: the copy being installed is the one this file sits in. */
+const PLUGIN_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const args = new Set(process.argv.slice(2));
 const wantAllDtypes = args.has("--all-dtypes");
 const force = args.has("--force");
 const modelsDir = defaultModelsDir();
 
-console.log(`memory-handoff weights -> ${modelsDir}`);
+installDependencies();
+
+console.log(`\nmemory-handoff weights -> ${modelsDir}`);
 
 let downloaded = 0;
 let verified = 0;
@@ -63,6 +77,50 @@ for (const role of ["embed", "rerank"]) {
 
 console.log(`\n${downloaded} downloaded, ${verified} already present and verified.`);
 console.log("Start the runtime with: bun runtime/serve.js");
+
+/**
+ * The dependency half: `bun install` into the plugin directory this file lives
+ * in, which is the copy the daemon will be started from. Production
+ * dependencies only, and from the committed lockfile, so this can never pull a
+ * version the tests never saw.
+ *
+ * Already installed is a no-op, and that matters more than it looks: the second
+ * run of this command is the common one, and a machine with no network must
+ * still get through it to the weights check.
+ *
+ * @returns {void}
+ */
+function installDependencies() {
+    const modules = join(PLUGIN_DIR, "node_modules");
+    const installed = join(modules, RUNTIME_DEPENDENCY, "package.json");
+
+    console.log(`memory-handoff dependencies -> ${modules}`);
+
+    if (existsSync(installed)) {
+        console.log(`  have ${RUNTIME_DEPENDENCY}`);
+
+        return;
+    }
+
+    const result = Bun.spawnSync([process.execPath, "install", "--production", "--frozen-lockfile"], {
+        cwd: PLUGIN_DIR,
+        stdio: ["ignore", "inherit", "inherit"],
+    });
+
+    if (!result.success) {
+        throw new Error(
+            `memory-handoff: the dependency half failed. \`bun install --production --frozen-lockfile\` exited ${result.exitCode} in ${PLUGIN_DIR}, so no weights were fetched. Check the network and run bun runtime/install.js again.`,
+        );
+    }
+
+    if (!existsSync(installed)) {
+        throw new Error(
+            `memory-handoff: the dependency half reported success and ${installed} is still not there, so no weights were fetched.`,
+        );
+    }
+
+    console.log(`  got  ${RUNTIME_DEPENDENCY}`);
+}
 
 /**
  * The files of one model at one dtype. `filesFor` answers paths relative to the
