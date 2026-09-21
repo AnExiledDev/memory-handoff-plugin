@@ -922,6 +922,10 @@ const planInjection = async ($, e) => {
 
     await safely($, () => warnIfNotInstalled($, found.document.degraded));
 
+    if ((await isInjecting($)) !== true) {
+        return rehearsedPlan(plan, "MEMORY_HANDOFF_INJECT is off, so nothing was attached");
+    }
+
     if ((await isLive($)) !== true) {
         return rehearsedPlan(plan);
     }
@@ -972,10 +976,10 @@ const failedPlan = (plan, reason) => ({ ...plan, disposition: "failed", reason, 
  * no ids and no characters. A failed retrieval reads differently because its
  * own row is the degraded one. Both are in the README.
  */
-const rehearsedPlan = (plan) => ({
+const rehearsedPlan = (plan, reason = "MEMORY_HANDOFF_LIVE is off, so nothing was attached") => ({
     ...plan,
     disposition: "rehearsed",
-    reason: "MEMORY_HANDOFF_LIVE is off, so nothing was attached",
+    reason,
     block: null,
     chars: 0,
     approxTokens: 0,
@@ -1163,6 +1167,7 @@ const drawMemoryPane = async ($, e) => {
     const elements = $.ui.resolve(e);
     const view = {
         live: await isLive($),
+        injecting: await isInjecting($),
         dbPath: await dbFile($),
         injections: session.injections,
         openKey: session.openRow,
@@ -1380,6 +1385,7 @@ const statusReport = async ($) => {
 
     return {
         live: await isLive($),
+        injecting: await isInjecting($),
         dir: await dataDir($),
         dbPath: await dbFile($),
         project: await projectFor($),
@@ -1558,7 +1564,31 @@ const dataDir = async ($) => {
 
 const isLive = async ($) => isOn(opt("live") ?? (await $.env.get("MEMORY_HANDOFF_LIVE")));
 
+/**
+ * Whether a retrieval's memories are attached to the prompt.
+ *
+ * On unless turned off, which is the opposite default to `live` and deliberate:
+ * a person who never sets this wants their memories, and the only reason to
+ * refuse them is the narrow one below.
+ *
+ * It is a separate knob from `live` because the two answer different questions.
+ * `live` gates writing and attaching together, so turning it off to stop the
+ * injection also stops the store filling. This one attaches nothing while
+ * writing continues, which is what measuring a memory's worth needs: the store
+ * fills from sessions the memories were not steering, so the next run's
+ * retrieval is scored against conversations it did not itself shape.
+ *
+ * The retrieval still runs and its row is still written. What a prompt WOULD
+ * have been given is the measurement; skipping the search to save the work
+ * would throw away the thing being measured, and the search is local (FTS5 plus
+ * on-disk weights), so it costs no money.
+ */
+const isInjecting = async ($) => !isOff(opt("inject") ?? (await $.env.get("MEMORY_HANDOFF_INJECT")));
+
 const isOn = (value) => ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
+
+/** Not `!isOn`: an unset knob has to fall through to its own default, not to off. */
+const isOff = (value) => ["0", "false", "no", "off"].includes((value ?? "").trim().toLowerCase());
 
 /** The plugin's own version, off the manifest the runtime loaded it from. */
 const pluginVersion = async ($) => {

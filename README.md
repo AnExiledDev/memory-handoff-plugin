@@ -1223,6 +1223,7 @@ memories were never owed is not a retrieval that failed.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
+| `MEMORY_HANDOFF_INJECT` | **on** | Off attaches nothing at all. Note that the caps below cannot do this: they take a whole number above zero, so `MEMORY_HANDOFF_INJECT_K=0` falls back to the default 5 rather than turning anything off. |
 | `MEMORY_HANDOFF_INJECT_K` | `5` | How many memories the retrieval is asked for. |
 | `MEMORY_HANDOFF_INJECT_MAX_ENTRIES` | `5` | How many may go into the block. |
 | `MEMORY_HANDOFF_INJECT_MAX_CHARS` | `4000` | How large the whole block may be. |
@@ -1248,9 +1249,13 @@ rows carries what happened:
 
 - **Injected.** A whole `retrievals` row, and an `injections` row beside it
   holding the memory ids, the characters and the caps.
-- **Rehearsed** (`MEMORY_HANDOFF_LIVE` off). A whole `retrievals` row, because
-  the search really ran, and an `injections` row with no ids and no characters,
-  `dropped` equal to everything that was found. Nothing reached the model.
+- **Rehearsed** (`MEMORY_HANDOFF_LIVE` off, or `MEMORY_HANDOFF_INJECT` off). A
+  whole `retrievals` row, because the search really ran, and an `injections` row
+  with no ids and no characters, `dropped` equal to everything that was found.
+  Nothing reached the model. The `reason` on the row names which knob did it,
+  and the pane's mode line distinguishes them: `rehearsing` for `LIVE`,
+  `storing only` for `INJECT`, since under the second one memories really are
+  still being written.
 - **Failed.** A `retrievals` row with `returned_n = 0` and the reason in
   `degraded` and in `filters.failure_reason`, and an `injections` row with no
   ids hanging off it.
@@ -1258,6 +1263,15 @@ rows carries what happened:
 Retrieval runs even when `MEMORY_HANDOFF_LIVE` is off, which is the point of
 rehearsing: you can watch what a session would have been given, in the pane and
 in the database, before you let it reach a model.
+
+`MEMORY_HANDOFF_INJECT=off` is the other half of that, and it exists for one
+job: measuring whether the memories are any good. Turning `LIVE` off stops the
+injection but also stops the store filling, so there is nothing new to judge.
+With `LIVE` on and `INJECT` off, compaction keeps writing memories while no
+session is steered by one, and the retrievals recorded against those sessions
+say what would have been offered to a conversation the memories did not shape.
+Scoring a retrieval against a session its own output helped write measures the
+loop, not the memory.
 
 ### The tools
 
@@ -1382,6 +1396,7 @@ have no row are read from the environment only.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `MEMORY_HANDOFF_LIVE` | off | Off, every compaction writes a `rehearsed` row and no fork runs, and every prompt's retrieval runs and attaches nothing. On, it forks and it injects. |
+| `MEMORY_HANDOFF_INJECT` | **on** | Off, the retrieval runs and its rows are written but nothing is attached to the prompt, while compaction goes on writing memories normally. The one knob whose default is on, and the only one that separates filling the store from being steered by it. |
 | `MEMORY_HANDOFF_DIR` | `~/.claude/memory-handoff` | Where rows, replies and `memory.sqlite` are kept. |
 | `MEMORY_HANDOFF_SESSION_BUDGET_USD` | `1.00` | What one session's generations may cost. A compaction past it writes an `overBudget` row and never forks. Zero or less is no ceiling. |
 | `MEMORY_HANDOFF_INJECT_K` | `5` | How many memories a prompt's retrieval asks for. |
