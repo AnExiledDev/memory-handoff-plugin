@@ -321,6 +321,45 @@ later prompt with nothing saying where it came from.
 The one-fifth floor is compact-handoff's, copied rather than imported so each
 plugin works without the other. If it moves, it moves in both.
 
+### Why a fork went cold, and the one compaction this plugin refuses
+
+A cold fork is not bad luck. A fork copies the conversation and appends the
+generation prompt to it, so a conversation that has just tripped the engine's
+auto-compaction threshold produces a fork transcript that is *also* over the
+threshold. The engine compacts that transcript too, and the fork then answers
+over the engine's summary of this conversation rather than over this
+conversation. It explains both halves of what was measured: the size (a summary
+plus the static prefix, not 165k) and the cache misses (a summary written a
+moment ago has never been sent before). It also explains why every cold fork
+compact-handoff recorded sat between 164k and 167k of context on `trigger:
+auto`, and none at any smaller size.
+
+So the plugin refuses that one dispatch. A `session.compact` carrying an
+`agentId` that arrives within five seconds of a fork this plugin is still
+waiting on is answered `{ skip }` instead of being handed on, and the fork keeps
+the real transcript. Five seconds is ten times the widest pairing measured (the
+twenty-five cold forks were each paired with an `agentId` dispatch 0.061 to
+0.433 seconds later). Past the window the dispatch is counted as `nestedLateSeen`
+and handed on untouched, and with no fork in flight nothing is refused at all,
+so a genuine subagent's compaction is never the one taken.
+
+This is the only compaction the plugin answers itself, and the transcript it
+refuses is a copy the plugin made and throws away when the fork replies. No
+conversation anybody can see compacts differently.
+
+Every forked row carries `nestedVetoed`, how many such dispatches were refused
+while that fork ran, and a `mismatch` row's `outcome_reason` names it:
+`mismatch (1 nested vetoed): ...`. **A `mismatch` row carrying `0 nested vetoed`
+is a cold fork this explanation does not cover**, and is the one reading that
+should reopen the question.
+
+Honest limit: no cold fork was ever reproduced on demand (eight sandbox sessions
+were driven for #690 and every one came back warm), so the refusal is proven by
+unit tests over the predicate and the hook, and by the mechanism accounting for
+every measured number — not by a before-and-after on a live cold fork. The proof
+is the next real auto-compaction above 164k on a box running this: it should
+write a `wrote` row carrying `nestedVetoed: 1`.
+
 The same compaction also writes `memory.sqlite`: one `generations` row, one
 `costs` row and one `memories` row per memory, in one transaction. The index
 row is the log and the database is the data, and they are written separately on
