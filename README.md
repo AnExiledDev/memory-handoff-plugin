@@ -50,6 +50,13 @@ directory it is run from, then the 161.6 MB of weights into
 A second run is a no-op for both halves and costs a sha256 of what is already
 there.
 
+**An upgrade needs it again.** `claude plugin install` and `claude plugin update`
+copy files and run nothing, so every new version lands a directory with no
+`node_modules`, and retrieval silently drops to the lexical arm until the command
+above is run in *that* directory. The first retrieval of a session that finds the
+runtime uninstalled now says so once in the session log, with the resolved path,
+rather than leaving it to whoever reads `retrievals.degraded`.
+
 **Without it the plugin still works and retrieval is worse.** Every compaction
 writes its memories with no vector, and every prompt retrieves on the lexical
 arm alone with `vector: unavailable` and the reason on the row; nothing throws
@@ -850,14 +857,26 @@ A `/health` that says the weights or the dependencies are missing spawns nothing
 at all and waits for nothing. Neither is a fact a fresh process changes, and
 both reasons already carry the command that does.
 
-**The honest bound is ensure + embed + rerank**, not "it never blocks". The wait
-above ends when `/health` says ready, and a daemon that finishes loading just
-after the window still gets called, so retrieval races every runtime call
-against `runtimeTimeoutMs` (default 5000 ms, `--runtime-timeout-ms` on the CLI)
-and treats an expiry as a degraded rung with its reason on the trace, never as
-an exception. Worst case for a prompt is the five-second start window plus one
-embed timeout plus one rerank timeout. A `{ db, client }` caller that builds its
-own client owns the client's own timeout as well.
+**The honest bound is `budgetMs`**, not "it never blocks". The wait above ends
+when `/health` says ready, and a daemon that finishes loading just after the
+window still gets called, so retrieval races every runtime call against
+`runtimeTimeoutMs` (default 5000 ms, `--runtime-timeout-ms` on the CLI) and
+treats an expiry as a degraded rung with its reason on the trace, never as an
+exception.
+
+That ceiling bounds one call, and the start window, the embed and the rerank run
+in sequence, so on its own it bounds a retrieval at three times itself. A caller
+that kills the process sooner than that gets *nothing* — degradation included,
+because the `retrievals` row is written last. That is not hypothetical: over 122
+retrievals measured on 2026-09-21, 82 were killed at the caller's 2500 ms bound
+and every one of them injected nothing.
+
+So `budgetMs` (`--budget-ms` on the CLI) is a deadline all three calls share.
+Each gets the smaller of its own ceiling and what is left, a call with nothing
+left is skipped with `the retrieval budget was spent` on the trace rather than
+started, and the worst case for a prompt is that one number. The prompt hook
+sets it below its own kill. A `{ db, client }` caller that builds its own client
+owns the client's own timeout as well.
 
 ### Degradation
 
@@ -886,7 +905,7 @@ is not a failure.
 bun retrieval/search-cli.js <db> --project P --query "..." [--k 5]
         [--types feedback,project] [--status active] [--since ISO] [--until ISO]
         [--origin manual] [--session-id ID] [--turn-id ID]
-        [--no-runtime] [--with-id] [--runtime-timeout-ms 5000]
+        [--no-runtime] [--with-id] [--runtime-timeout-ms 5000] [--budget-ms N]
 printf '%s' "..." | bun retrieval/search-cli.js <db> --project P --query-stdin
 bun retrieval/explain-cli.js <db> <retrievalId> [--json]
 ```
@@ -1088,9 +1107,9 @@ many candidates did not fit.
 
 The retrieval runs as a Bun child (`retrieval/search-cli.js`, handed the prompt
 over stdin rather than on its argv, where `ps` would show it) bounded by
-`MEMORY_HANDOFF_INJECT_TIMEOUT_MS`, 2500 ms by default, and the embedding
-runtime inside it is bounded lower still so it has time to write its own
-degraded row before it is killed. On a timeout, a non-zero exit or output that
+`MEMORY_HANDOFF_INJECT_TIMEOUT_MS`, 4000 ms by default, and the child is handed
+`--budget-ms` lower still — one deadline across every runtime call it makes — so
+it has time to write its own degraded row before it is killed. On a timeout, a non-zero exit or output that
 is not a document, **the prompt goes down with no memories and no delay beyond
 the bound**, and the failure is recorded rather than swallowed.
 
@@ -1195,7 +1214,7 @@ same way an interactive one is.
 | `MEMORY_HANDOFF_INJECT_K` | `5` | How many memories a prompt's retrieval asks for. |
 | `MEMORY_HANDOFF_INJECT_MAX_ENTRIES` | `5` | How many may go into one injected block. |
 | `MEMORY_HANDOFF_INJECT_MAX_CHARS` | `4000` | How large one injected block may be. |
-| `MEMORY_HANDOFF_INJECT_TIMEOUT_MS` | `2500` | Hard bound on the retrieval child at prompt time. Past it the prompt goes down with no memories. Measured 2026-09-17: ~430 ms warm, ~1650 ms when the child has to start the runtime. |
+| `MEMORY_HANDOFF_INJECT_TIMEOUT_MS` | `4000` | Hard bound on the retrieval child at prompt time. Past it the prompt goes down with no memories. The child gets this minus 700 ms as `--budget-ms`, the deadline its runtime calls share. Measured 2026-09-21 on a loaded box: 1326 ms for a full embed + 30-pair rerank over 90 memories. Was 2500 ms, which killed 82 of 122 measured retrievals. |
 
 The runtime's four variables are in its own section, under Runtime.
 

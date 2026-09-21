@@ -24,8 +24,12 @@
  * for as long as its ONNX sessions take to load. Every call out of here is
  * raced against `runtimeTimeoutMs`, and a call that overruns is a degraded rung
  * with its reason on the trace, exactly like a runtime that was never there.
- * The worst case is the autostart window plus the embed timeout plus the rerank
- * timeout — not "never blocks", which was never true.
+ *
+ * `runtimeTimeoutMs` alone bounds each call and not their sum, so the worst case
+ * used to be the autostart window plus the embed timeout plus the rerank
+ * timeout. A caller that kills this process sooner than that sum got nothing at
+ * all, degradation included. `budgetMs` is the deadline they share: the worst
+ * case is that one number, and the caller sets it below its own kill.
  *
  * **Every retrieval is explainable from the database alone.** One `retrievals`
  * row, one `retrieval_candidates` row per candidate considered including the
@@ -69,6 +73,27 @@ export const RERANK_CAP = 30;
  */
 export const RUNTIME_TIMEOUT_MS = 5000;
 
+/**
+ * How long the whole retrieval is given, across every runtime call it makes.
+ *
+ * `RUNTIME_TIMEOUT_MS` bounds *one* call. Three of them run in sequence — the
+ * autostart wait, the embed, the rerank — so the per-call ceiling alone bounds
+ * the search at three times itself, and the caller that kills this process does
+ * not wait that long. When it kills mid-degradation the `retrievals` row is
+ * never written and the prompt gets nothing, which is not the FTS5-only answer
+ * this file is built to fall back to.
+ *
+ * Measured on this box 2026-09-21 against a warm daemon: embed 53 ms, a 30-pair
+ * rerank 537 ms. Measured against the live store over 122 retrievals, 82 were
+ * killed at the outer 2500 ms bound and every one of them returned nothing.
+ *
+ * So the budget is a deadline, not a third ceiling: every call gets the smaller
+ * of its own ceiling and what is left of this, and a call with nothing left is
+ * skipped rather than started. Null means no deadline, which is what a CLI or a
+ * test gets when it does not ask for one.
+ */
+export const DEFAULT_BUDGET_MS = null;
+
 /** What `retrievals.query_source` records. The raw prompt, decided in #683; the column exists so an extracted query can be compared later. */
 export const QUERY_SOURCE = "raw-prompt";
 
@@ -85,6 +110,7 @@ export const LOCAL_BASIS = "local: no API spend";
  * @property {string | null} [until]
  * @property {number} [k] Clamped to `RERANK_CAP`; the trace records the number asked for.
  * @property {number} [runtimeTimeoutMs] How long any one runtime call is given. Defaults to `RUNTIME_TIMEOUT_MS`.
+ * @property {number} [budgetMs] How long every runtime call gets between them. Defaults to `DEFAULT_BUDGET_MS`, which is no deadline.
  * @property {"prompt" | "tool" | "manual"} [origin]
  * @property {string | null} [sessionId]
  * @property {string | null} [turnId]
@@ -117,6 +143,8 @@ export const search = async (request, deps) => {
     const match = buildMatch(request.query);
     const embedText = truncateForEmbedding(request.query);
     const timeoutMs = Number.isFinite(request.runtimeTimeoutMs) && Number(request.runtimeTimeoutMs) > 0 ? Number(request.runtimeTimeoutMs) : RUNTIME_TIMEOUT_MS;
+    const budgetMs = Number.isFinite(request.budgetMs) && Number(request.budgetMs) > 0 ? Number(request.budgetMs) : DEFAULT_BUDGET_MS;
+    const allow = deadlineFrom({ startedAt, budgetMs, now });
 
     const stages = { embed: null, fts: null, vector: null, rerank: null };
     const degradations = [];
@@ -150,10 +178,10 @@ export const search = async (request, deps) => {
 
     stages.fts = now() - ftsStarted;
 
-    const runtime = await readiness(deps, timeoutMs);
-    const vector = await vectorArm({ deps, filters, embedText, runtime, timeoutMs, now, stages, degradations, notes });
+    const runtime = await readiness(deps, allow(timeoutMs));
+    const vector = await vectorArm({ deps, filters, embedText, runtime, timeoutMs, allow, now, stages, degradations, notes });
     const merged = mergeArms({ fts, vector: vector.hits });
-    const reranked = await rerankArm({ deps, request, merged, runtime, timeoutMs, now, stages, degradations, notes });
+    const reranked = await rerankArm({ deps, request, merged, runtime, timeoutMs, allow, now, stages, degradations, notes });
     const ordered = orderForReturn(reranked.candidates, reranked.scores);
     const text = textOf(deps.db, ordered.map((candidate) => candidate.memoryId));
 
@@ -185,7 +213,7 @@ export const search = async (request, deps) => {
  * never throws — and all of them mean the same thing to a caller: FTS5-only,
  * with `vector: unavailable` on the row.
  */
-const vectorArm = async ({ deps, filters, embedText, runtime, timeoutMs, now, stages, degradations, notes }) => {
+const vectorArm = async ({ deps, filters, embedText, runtime, timeoutMs, allow, now, stages, degradations, notes }) => {
     const unavailable = (reason) => {
         degradations.push("vector: unavailable");
         notes.vector_unavailable_reason = reason;
@@ -198,7 +226,7 @@ const vectorArm = async ({ deps, filters, embedText, runtime, timeoutMs, now, st
     }
 
     const embedStarted = now();
-    const embedded = await withTimeout(() => deps.client.embed([embedText.text], { kind: "query" }), timeoutMs, "the query embedding");
+    const embedded = await withTimeout(() => deps.client.embed([embedText.text], { kind: "query" }), allow(timeoutMs), "the query embedding");
 
     stages.embed = now() - embedStarted;
 
@@ -273,6 +301,31 @@ const readiness = async (deps, timeoutMs) => {
 };
 
 /**
+ * What is left of the whole retrieval's deadline, as a ceiling on one call.
+ *
+ * `allow(want)` is the smaller of that call's own ceiling and the time left, so
+ * the calls in sequence share one budget instead of each starting a fresh one.
+ * Zero means the deadline is spent and the call must not be started: a call
+ * begun with nothing left cannot finish inside it, and starting it is what gets
+ * the whole process killed before it can write its row.
+ *
+ * @param {{ startedAt: number, budgetMs: number | null, now: () => number }} options
+ * @returns {(want: number) => number}
+ */
+export const deadlineFrom = ({ startedAt, budgetMs, now }) => {
+    if (budgetMs === null) {
+        return (want) => want;
+    }
+
+    const endsAt = startedAt + budgetMs;
+
+    return (want) => Math.max(0, Math.min(want, endsAt - now()));
+};
+
+/** The reason a call never ran, so the trace says "spent", not "unavailable". */
+const SPENT = "the retrieval budget was spent before the call could start";
+
+/**
  * One call to the runtime, bounded.
  *
  * The client never throws, so the only thing it can do wrong is take too long,
@@ -290,6 +343,10 @@ const readiness = async (deps, timeoutMs) => {
  * @returns {Promise<T | { ok: false, reason: string }>}
  */
 const withTimeout = async (call, ms, what) => {
+    if (ms <= 0) {
+        return { ok: false, reason: SPENT };
+    }
+
     let timer = null;
     const expired = new Promise((resolve) => {
         timer = setTimeout(() => resolve({ ok: false, reason: `${what} did not answer within ${ms} ms` }), ms);
@@ -310,7 +367,7 @@ const withTimeout = async (call, ms, what) => {
  * comparable only inside one call, so they order this call's candidates and
  * mean nothing outside it.
  */
-const rerankArm = async ({ deps, request, merged, runtime, timeoutMs, now, stages, degradations, notes }) => {
+const rerankArm = async ({ deps, request, merged, runtime, timeoutMs, allow, now, stages, degradations, notes }) => {
     const capped = merged.slice(0, RERANK_CAP);
 
     const unavailable = (reason) => {
@@ -338,7 +395,7 @@ const rerankArm = async ({ deps, request, merged, runtime, timeoutMs, now, stage
     notes.rerank_query_truncated_to = queryText.truncated ? queryText.text.length : null;
 
     const started = now();
-    const ranked = await withTimeout(() => deps.client.rerank(queryText.text, documents), timeoutMs, "the rerank");
+    const ranked = await withTimeout(() => deps.client.rerank(queryText.text, documents), allow(timeoutMs), "the rerank");
 
     stages.rerank = now() - started;
 

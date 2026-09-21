@@ -5,7 +5,7 @@
  *     bun retrieval/search-cli.js <db> --project P --query "..." [--k 5]
  *         [--types user,project] [--status active] [--since ISO] [--until ISO]
  *         [--origin manual|prompt|tool] [--session-id ID] [--turn-id ID]
- *         [--runtime-timeout-ms N] [--no-runtime] [--with-id]
+ *         [--runtime-timeout-ms N] [--budget-ms N] [--no-runtime] [--with-id]
  *     printf '%s' "..." | bun retrieval/search-cli.js <db> --project P --query-stdin
  *
  * `--query-stdin` reads the query off stdin instead of the argv, and is what
@@ -32,9 +32,9 @@
 import { openMemoryDb } from "../schema/bun-sqlite.js";
 import { createClient } from "../runtime/client.js";
 import { ensureRuntime } from "./ensure-runtime.js";
-import { RUNTIME_TIMEOUT_MS, search } from "./search.js";
+import { DEFAULT_BUDGET_MS, RUNTIME_TIMEOUT_MS, search } from "./search.js";
 
-const USAGE = "usage: bun retrieval/search-cli.js <db> --project P (--query \"...\" | --query-stdin) [--k N] [--types a,b] [--status a,b] [--since ISO] [--until ISO] [--origin manual|prompt|tool] [--session-id ID] [--turn-id ID] [--runtime-timeout-ms N] [--no-runtime] [--with-id]";
+const USAGE = "usage: bun retrieval/search-cli.js <db> --project P (--query \"...\" | --query-stdin) [--k N] [--types a,b] [--status a,b] [--since ISO] [--until ISO] [--origin manual|prompt|tool] [--session-id ID] [--turn-id ID] [--runtime-timeout-ms N] [--budget-ms N] [--no-runtime] [--with-id]";
 
 /**
  * `fetch` with the same ceiling `search()` races its calls against, so a
@@ -80,6 +80,7 @@ const main = async () => {
     }
 
     const timeoutMs = flags["runtime-timeout-ms"] === undefined ? RUNTIME_TIMEOUT_MS : Number.parseInt(flags["runtime-timeout-ms"], 10);
+    const budgetMs = flags["budget-ms"] === undefined ? DEFAULT_BUDGET_MS : Number.parseInt(flags["budget-ms"], 10);
     const opened = openMemoryDb(dbPath);
     const client = flags["no-runtime"] === true ? null : createClient({ fetchText: boundedFetchText(timeoutMs) });
 
@@ -100,6 +101,10 @@ const main = async () => {
                 sessionId: idOf(flags["session-id"]),
                 turnId: idOf(flags["turn-id"]),
                 runtimeTimeoutMs: timeoutMs,
+                // The deadline every runtime call shares. A caller that kills
+                // this process sets it below its own kill, so the degraded row
+                // is written and printed rather than dying with the process.
+                budgetMs,
             },
             {
                 db: opened.db,
