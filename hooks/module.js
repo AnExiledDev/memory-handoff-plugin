@@ -213,6 +213,28 @@ const EMPTY_SESSION = {
 const THREW = { ok: false, reason: "memory-handoff: the call threw, and the reason is in the session's debug log" };
 
 /**
+ * The manifest's `userConfig`, as `register` was handed it. Every setting here
+ * was an environment variable first and both spellings still work, the
+ * manifest's winning: a config-menu row is the discoverable half, and the
+ * variable is what a cron line already exports around the session.
+ */
+let options = {};
+
+/**
+ * One `userConfig` value as a non-empty string, or `undefined` so that `??`
+ * falls through to the variable. Stringified, because the existing parsers
+ * below take the text `$.env.get` returns and a declared number or boolean has
+ * to read the same way to them.
+ */
+const opt = (key) => {
+    const value = options[key];
+
+    if (value === undefined || value === null || value === "") return undefined;
+
+    return String(value).trim() || undefined;
+};
+
+/**
  * Three environment variables steer this, and the static scan will only take
  * them spelled out at the call site, so they are named here and nowhere else:
  *
@@ -227,7 +249,9 @@ const THREW = { ok: false, reason: "memory-handoff: the call threw, and the reas
  * - `MEMORY_HANDOFF_SESSION_BUDGET_USD` what one session's generations may cost
  *   before the next one is skipped.
  */
-export const register = (on) => {
+export const register = (on, pluginOptions) => {
+    options = pluginOptions ?? {};
+
     on("session.start", async ($, e, next) => {
         session = freshSession();
 
@@ -1234,15 +1258,15 @@ const dbFile = async ($) => `${await dataDir($)}/memory.sqlite`;
  * a long session is not a restart.
  */
 const injectCaps = async ($) => ({
-    k: wholeNumber(await $.env.get("MEMORY_HANDOFF_INJECT_K"), DEFAULT_INJECT_K),
-    maxEntries: wholeNumber(await $.env.get("MEMORY_HANDOFF_INJECT_MAX_ENTRIES"), DEFAULT_MAX_ENTRIES),
-    maxChars: wholeNumber(await $.env.get("MEMORY_HANDOFF_INJECT_MAX_CHARS"), DEFAULT_MAX_CHARS),
-    timeoutMs: wholeNumber(await $.env.get("MEMORY_HANDOFF_INJECT_TIMEOUT_MS"), DEFAULT_INJECT_MS),
+    k: wholeNumber(opt("injectK") ?? (await $.env.get("MEMORY_HANDOFF_INJECT_K")), DEFAULT_INJECT_K),
+    maxEntries: wholeNumber(opt("injectMaxEntries") ?? (await $.env.get("MEMORY_HANDOFF_INJECT_MAX_ENTRIES")), DEFAULT_MAX_ENTRIES),
+    maxChars: wholeNumber(opt("injectMaxChars") ?? (await $.env.get("MEMORY_HANDOFF_INJECT_MAX_CHARS")), DEFAULT_MAX_CHARS),
+    timeoutMs: wholeNumber(opt("injectTimeoutMs") ?? (await $.env.get("MEMORY_HANDOFF_INJECT_TIMEOUT_MS")), DEFAULT_INJECT_MS),
 });
 
 /** What this session's generations may cost. Zero or less is no ceiling at all. */
 const sessionBudget = async ($) => {
-    const raw = Number.parseFloat(((await $.env.get("MEMORY_HANDOFF_SESSION_BUDGET_USD")) ?? "").trim());
+    const raw = Number.parseFloat((opt("sessionBudgetUsd") ?? (await $.env.get("MEMORY_HANDOFF_SESSION_BUDGET_USD")) ?? "").trim());
     const budget = Number.isFinite(raw) ? raw : DEFAULT_BUDGET_USD;
 
     return budget > 0 ? budget : null;
@@ -1436,7 +1460,7 @@ const registerTools = async ($) => {
 };
 
 const dataDir = async ($) => {
-    const override = ((await $.env.get("MEMORY_HANDOFF_DIR")) ?? "").trim();
+    const override = (opt("dir") ?? (await $.env.get("MEMORY_HANDOFF_DIR")) ?? "").trim();
 
     if (override !== "") {
         return override.replace(/\/+$/u, "");
@@ -1447,7 +1471,7 @@ const dataDir = async ($) => {
     return home === "" ? `${$.plugin.root}/.runs` : `${home}/.claude/memory-handoff`;
 };
 
-const isLive = async ($) => isOn(await $.env.get("MEMORY_HANDOFF_LIVE"));
+const isLive = async ($) => isOn(opt("live") ?? (await $.env.get("MEMORY_HANDOFF_LIVE")));
 
 const isOn = (value) => ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
 
