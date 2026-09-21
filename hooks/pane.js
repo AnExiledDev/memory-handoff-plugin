@@ -70,17 +70,32 @@ export const paneTree = (elements, view, columns = DEFAULT_COLUMNS, actions = {}
     });
 };
 
+/**
+ * Two knobs can leave the pane with memories it never attached, and the mode
+ * has to name the one actually in force. `inject` is checked first because a
+ * person who set it chose it, where `live` off is the shipped default.
+ */
 const headline = (view, injections) => {
     const total = injections.reduce((sum, injection) => sum + (injection.entries?.length ?? 0), 0);
-    const mode = view?.live === true ? "" : "  (rehearsing: nothing was injected)";
 
-    return `Memories  ${injections.length} prompts, ${total} memories${mode}`;
+    return `Memories  ${injections.length} prompts, ${total} memories${modeOf(view)}`;
 };
 
-const emptyLine = (view) =>
-    view?.live === true
+const modeOf = (view) => {
+    if (view?.injecting === false) return "  (storing only: nothing was injected)";
+
+    return view?.live === true ? "" : "  (rehearsing: nothing was injected)";
+};
+
+const emptyLine = (view) => {
+    if (view?.injecting === false) {
+        return "Nothing injected yet this session. MEMORY_HANDOFF_INJECT is off.";
+    }
+
+    return view?.live === true
         ? "Nothing injected yet this session."
         : "Nothing injected yet this session. MEMORY_HANDOFF_LIVE is off.";
+};
 
 /** One prompt: what was typed, what the retrieval was, and what went in. */
 const injectionBox = (elements, injection, index, width, view, actions) => {

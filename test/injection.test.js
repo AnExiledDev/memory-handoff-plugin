@@ -286,6 +286,82 @@ describe("rehearsing", () => {
     });
 });
 
+describe("storing without injecting", () => {
+    // The whole point of the knob: a session that fills the store but is not
+    // steered by it, so the next run's retrieval is scored against
+    // conversations its own memories did not shape.
+    it("retrieves and records, and attaches nothing, while live stays on", async () => {
+        const host = fakeApi({ env: { MEMORY_HANDOFF_INJECT: "off" } });
+        const { next } = await submitted(host);
+        const row = host.adminDocs("injection").at(0);
+
+        assert.equal(host.childrenOf("search").length, 1);
+        assert.equal(contextOf(next).length, 0);
+        assert.equal(row.retrievalId, 7);
+        assert.deepEqual(row.memoryIds, []);
+        assert.equal(row.chars, 0);
+        assert.equal(row.dropped, 2);
+        assert.equal(row.failure, undefined);
+    });
+
+    // The bug this knob invites. `inject` defaults ON where `live` defaults
+    // OFF, so writing it as `isOn` would silently stop injecting for every
+    // person who never set it. `injectK: 0` already fails this way one file
+    // over, which is why the test is here and not left to the type.
+    it("injects when nothing is set, because on is its default", async () => {
+        const host = fakeApi({ env: { MEMORY_HANDOFF_INJECT: undefined } });
+        const { next } = await submitted(host);
+
+        assert.equal(contextOf(next).length, 1);
+        assert.ok(contextOf(next)[0].startsWith(HEADER));
+    });
+
+    it("injects on any value that is not a spelling of off", async () => {
+        const host = fakeApi({ env: { MEMORY_HANDOFF_INJECT: "yes please" } });
+        const { next } = await submitted(host);
+
+        assert.equal(contextOf(next).length, 1);
+    });
+
+    it("reads off, no, 0 and false as off", async () => {
+        for (const value of ["off", "no", "0", "false", "OFF", " off "]) {
+            const host = fakeApi({ env: { MEMORY_HANDOFF_INJECT: value } });
+            const { next } = await submitted(host);
+
+            assert.equal(contextOf(next).length, 0, `${value} should have been off`);
+        }
+    });
+
+    it("tells the status report, so a quiet pane is explicable", async () => {
+        const host = fakeApi({ env: { MEMORY_HANDOFF_INJECT: "off" } });
+        const runtime = await started(host);
+        const answer = await runtime.dispatch(
+            "tool.call",
+            host.$,
+            { tool: "mcp__memory-handoff__memory_status" },
+            passThrough(),
+        );
+
+        assert.equal(JSON.parse(answer.result).injecting, false);
+    });
+
+    // Without this the pane reads "3 prompts, 0 memories" with no reason
+    // given, because its only mode line was keyed off `live`, which is on.
+    it("says storing only in the pane rather than claiming an injection", () => {
+        const head = paneLines(paneTree(elementTable(), { injecting: false, live: true }, 80))
+            .find((line) => line.startsWith("Memories"));
+
+        assert.ok(head.includes("(storing only: nothing was injected)"), head);
+    });
+
+    it("still names LIVE when that is the one that is off", () => {
+        const head = paneLines(paneTree(elementTable(), { injecting: true, live: false }, 80))
+            .find((line) => line.startsWith("Memories"));
+
+        assert.ok(head.includes("(rehearsing: nothing was injected)"), head);
+    });
+});
+
 describe("the tools", () => {
     const call = async (host, tool, input = {}) => {
         const runtime = await started(host);
