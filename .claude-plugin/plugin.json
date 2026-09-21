@@ -1,10 +1,54 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "memory-handoff",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Turns the conversation a compaction is about to throw away into durable memories",
   "author": {
     "name": "AnExiledDev",
     "email": "696222+AnExiledDev@users.noreply.github.com"
+  },
+  "userConfig": {
+    "live": {
+      "type": "boolean",
+      "title": "Live",
+      "description": "Off, every compaction writes a rehearsed row and nothing reaches the model. On, it forks and it injects.",
+      "default": false
+    },
+    "dir": {
+      "type": "string",
+      "title": "Data directory",
+      "description": "Where rows, replies and memory.sqlite are kept. Empty uses ~/.claude/memory-handoff.",
+      "default": ""
+    },
+    "sessionBudgetUsd": {
+      "type": "string",
+      "title": "Session budget (USD)",
+      "description": "What one session's generations may cost. Empty uses 1.00; zero or less is no ceiling.",
+      "default": ""
+    },
+    "injectK": {
+      "type": "number",
+      "title": "Memories retrieved",
+      "description": "How many memories the retrieval is asked for. Empty uses 5.",
+      "default": 0
+    },
+    "injectMaxEntries": {
+      "type": "number",
+      "title": "Memories injected",
+      "description": "How many may go into the block. Empty uses 5.",
+      "default": 0
+    },
+    "injectMaxChars": {
+      "type": "number",
+      "title": "Injected block ceiling",
+      "description": "How large the whole block may be, in characters. Empty uses 4000.",
+      "default": 0
+    },
+    "injectTimeoutMs": {
+      "type": "number",
+      "title": "Retrieval timeout (ms)",
+      "description": "How long retrieval may take before the prompt goes on without it. Empty uses 2500.",
+      "default": 0
+    }
   }
 }
