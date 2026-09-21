@@ -488,6 +488,41 @@ describe("a runtime that answers and then does not", () => {
         });
     });
 
+    // Each call gets its own ceiling, so two hanging calls in sequence cost two
+    // of them. The caller is a prompt hook that kills the whole child on one
+    // bound, and a child killed here writes no `retrievals` row at all: 82 of
+    // 122 retrievals in the live store on 2026-09-21 ended exactly that way,
+    // each returning nothing. The deadline is what keeps the sum under the
+    // caller's kill, so the degraded answer survives to be injected.
+    it("keeps every hanging call inside one shared budget", async () => {
+        await withDb(async ({ db }) => {
+            seed(db);
+
+            const startedAt = Date.now();
+            const answer = await search(
+                { query: QUERY, project: PROJECT, runtimeTimeoutMs: 400, budgetMs: 450 },
+                { db, client: client({ embedHangs: true, rerankHangs: true }) },
+            );
+            const elapsed = Date.now() - startedAt;
+            const filters = JSON.parse(retrievalOf(db, answer.retrievalId).filters);
+
+            assert.ok(elapsed < 800, `the whole search fit in the budget, took ${elapsed} ms`);
+            assert.match(filters.vector_unavailable_reason, /did not answer within/u);
+            assert.ok(answer.results.length > 0, "the lexical arm still answers");
+
+            // The embed spent most of the budget, so the rerank is either
+            // skipped outright or started on the remainder. What must not
+            // happen is a second full 400 ms ceiling, which is what made the
+            // sum exceed the caller's kill.
+            const rerankCeilingMs = Number(/within (\d+) ms/u.exec(filters.rerank_unavailable_reason)?.[1] ?? 0);
+
+            assert.ok(
+                /budget was spent/u.test(filters.rerank_unavailable_reason) || rerankCeilingMs < 400,
+                `the rerank was cut to the remaining budget: ${filters.rerank_unavailable_reason}`,
+            );
+        });
+    });
+
     // The reranker is behind the same daemon the autostart just gave up on.
     // Posting to it anyway buys a second full timeout for an answer already
     // known.

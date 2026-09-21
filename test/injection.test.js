@@ -479,6 +479,36 @@ describe("the pane", () => {
         assert.ok(host.logs[0].includes("no surface"));
     });
 
+    it("says once per session how to install a runtime that is not installed", async () => {
+        const host = fakeApi({
+            search: searchDocument(2, {
+                degraded: "dependencies missing (@huggingface/transformers): run bun runtime/install.js",
+            }),
+        });
+        const runtime = await started(host);
+
+        await runtime.dispatch("prompt.submit", host.$, promptInput(), passThrough());
+        await runtime.dispatch("prompt.submit", host.$, promptInput(), passThrough());
+
+        // Once, not once a prompt. A line on every prompt is how a person
+        // learns to scroll past the one line that carries the fix.
+        assert.equal(host.logs.length, 1);
+        // The directory is the whole difficulty: an upgrade lands a new version
+        // directory and the command has to be run in that one.
+        assert.ok(host.logs[0].includes("cd /plugin && bun runtime/install.js"), host.logs[0]);
+    });
+
+    it("stays quiet when an arm is down for any other reason", async () => {
+        // "rerank: unavailable" on a daemon that is installed and busy is not
+        // something a person can fix with a command, so it is not worth a line.
+        const host = fakeApi({ search: searchDocument(2, { degraded: "rerank: unavailable" }) });
+        const runtime = await started(host);
+
+        await runtime.dispatch("prompt.submit", host.$, promptInput(), passThrough());
+
+        assert.deepEqual(host.logs, []);
+    });
+
     it("leaves another plugin's pane to its own hook", async () => {
         const host = fakeApi();
         const runtime = await started(host);

@@ -128,19 +128,26 @@ const TOOL_DELETE = "mcp__memory-handoff__memory_delete";
 const DEFAULT_INJECT_K = 5;
 const DEFAULT_MAX_ENTRIES = 5;
 const DEFAULT_MAX_CHARS = 4000;
-const DEFAULT_INJECT_MS = 2500;
+const DEFAULT_INJECT_MS = 4000;
 const DEFAULT_BUDGET_USD = 1;
 
 /**
- * How much of the prompt's own budget the child's runtime wait may take.
+ * How much of the prompt's own budget belongs to the child rather than its
+ * model calls.
  *
- * The outer `timeoutMs` is the hard bound on the whole child; the runtime wait
- * inside it has to end first, or the child is killed mid-degradation and the
- * `retrievals` row it was about to write is never written. Measured on
+ * The outer `timeoutMs` is the hard bound on the whole child; everything the
+ * child does inside it has to end first, or the child is killed mid-degradation
+ * and the `retrievals` row it was about to write is never written. Measured on
  * 2026-09-17 against a cold daemon: the bun child itself costs ~330 ms before
- * the wait starts, and a cold embed plus the rerank and the row is ~450 ms
- * after it ends, so the margin covers that and the whole child fits inside
- * `DEFAULT_INJECT_MS` (1650 ms cold, ~430 ms warm).
+ * the first call starts, and the row and the JSON on stdout are ~450 ms after
+ * the last one ends.
+ *
+ * This is now taken off a single deadline (`--budget-ms`) that every runtime
+ * call shares, not off each call separately. Until 2026-09-21 the child passed
+ * the same figure as the per-call ceiling for the autostart wait, the embed and
+ * the rerank, so three sequential calls could reach three times it: 82 of 122
+ * retrievals in the live store were killed before writing anything, and every
+ * one of them injected nothing.
  */
 const RUNTIME_MARGIN_MS = 700;
 
@@ -186,6 +193,8 @@ const freshSession = () => ({
     openRow: null,
     /** The project key, worked out once from git. `null` until it is. */
     project: null,
+    /** Whether this session has already said the runtime is not installed. Said once, not every prompt. */
+    warnedNotInstalled: false,
 });
 
 let session = freshSession();
@@ -802,11 +811,44 @@ const planInjection = async ($, e) => {
     plan.chars = composed.chars;
     plan.approxTokens = composed.approxTokens;
 
+    await safely($, () => warnIfNotInstalled($, found.document.degraded));
+
     if ((await isLive($)) !== true) {
         return rehearsedPlan(plan);
     }
 
     return plan;
+};
+
+/**
+ * What a retrieval says when the runtime was never installed here.
+ *
+ * `claude plugin install` copies files and runs nothing, so every upgrade lands
+ * a version directory with no `node_modules` and the vector and rerank arms
+ * both go quiet. Nothing throws — the reason goes on the `retrievals` row and
+ * the search still answers on FTS5 — so the only way anyone found out was by
+ * reading the table. On this box 0.7.0 ran that way until it was noticed.
+ */
+const NOT_INSTALLED = /dependencies missing|weights missing/iu;
+
+/**
+ * Say it once, in the session, when the runtime is not installed.
+ *
+ * The log line carries the resolved directory because that is the whole
+ * difficulty: the command is run in the version directory the upgrade just
+ * created, and a person who upgrades has no reason to know which one that is.
+ */
+const warnIfNotInstalled = async ($, degraded) => {
+    if (session.warnedNotInstalled || typeof degraded !== "string" || !NOT_INSTALLED.test(degraded)) {
+        return;
+    }
+
+    session.warnedNotInstalled = true;
+
+    await $.ui.log(
+        `memory-handoff: retrieval is lexical-only because the local runtime is not installed for this version. ` +
+            `To restore the vector and rerank arms: cd ${$.plugin.root} && bun runtime/install.js`,
+    );
 };
 
 /** A plan that never reached a retrieval, or reached one that did not answer. */
@@ -856,9 +898,11 @@ const paneEntry = (entry) => {
  * The retrieval, as a bounded child.
  *
  * Bounded twice: `timeoutMs` is the hard stop on the whole child and the only
- * thing standing between a wedged runtime and the person's Enter, and the
- * runtime wait inside it is set lower so the child still has time to write its
- * own degraded row before it is killed. `$.process.run` rejects on the timeout
+ * thing standing between a wedged runtime and the person's Enter, and
+ * `--budget-ms` inside it is set lower so the child still has time to write its
+ * own degraded row before it is killed. The budget is a deadline across every
+ * runtime call the child makes, which is what makes "set lower" true of their
+ * sum rather than only of each one. `$.process.run` rejects on the timeout
  * rather than resolving with a code, which is why the call is wrapped.
  *
  * The query goes over stdin, never the argv: the query here is the prompt the
@@ -878,6 +922,8 @@ const searchForPrompt = async ($, plan) => {
         "--origin",
         "prompt",
         "--runtime-timeout-ms",
+        String(runtimeMs),
+        "--budget-ms",
         String(runtimeMs),
         "--with-id",
         ...(typeof plan.sessionId === "string" && plan.sessionId !== "" ? ["--session-id", plan.sessionId] : []),
