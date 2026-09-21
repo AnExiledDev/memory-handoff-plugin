@@ -314,6 +314,57 @@ describe("alone, the plugin's own session.compact hook carries it", () => {
         assert.equal(next.calls.length, 1);
     });
 
+    // #767: the engine compacts the fork's own loop while the fork is in
+    // flight, and the fork then answers a summary of this conversation instead
+    // of this conversation. Refusing that one dispatch is what keeps the fork
+    // warm, and it is the only compaction this plugin ever answers itself.
+    it("refuses the engine's compaction of a fork's own transcript, mid-fork", async () => {
+        let nested = null;
+        const host = fakeApi({
+            fork: async () => {
+                nested = await runtime.dispatch(
+                    "session.compact",
+                    host.$,
+                    compactInput({ agentId: "fork-loop-1" }),
+                    passThrough(),
+                );
+
+                return forkReply();
+            },
+        });
+        const runtime = await started(host);
+
+        await runtime.dispatch("session.compact", host.$, compactInput(), passThrough());
+
+        assert.match(String(nested.skip), /memory fork's own transcript/u);
+        // The refused dispatch is not a generation, so it leaves no row of its
+        // own; the fork it protected is the row.
+        const rows = host.rowsIn("index.jsonl");
+
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].outcome, "extracted");
+        assert.equal(rows[0].nestedVetoed, 1);
+    });
+
+    // A subagent that happens to compact while nothing is forking keeps its
+    // compaction, which is the case #690 said made this fix untestable.
+    it("still passes a subagent's compaction through when no fork is running", async () => {
+        const host = fakeApi({});
+        const runtime = await started(host);
+        const next = passThrough();
+
+        const answer = await runtime.dispatch(
+            "session.compact",
+            host.$,
+            compactInput({ agentId: "agent-7" }),
+            next,
+        );
+
+        assert.deepEqual(answer, { passedThrough: true });
+        assert.equal(next.calls.length, 1);
+        assert.equal(host.rowsIn("index.jsonl")[0].outcome, "subagent");
+    });
+
     it("rehearses until MEMORY_HANDOFF_LIVE is on", async () => {
         let forks = 0;
         const host = fakeApi({
@@ -390,7 +441,9 @@ describe("a generation that fails costs a row and nothing else", () => {
         // `generations.outcome` takes six strings and the CHECK refuses a
         // seventh, so the refusal is a `failed` row whose reason names it.
         assert.equal(doc.generation.outcome, "failed");
-        assert.match(doc.generation.outcomeReason, /^mismatch: the fork was charged for 24000/u);
+        // The veto count rides on the reason because a cold fork with no nested
+        // compaction behind it is the reading that reopens #767.
+        assert.match(doc.generation.outcomeReason, /^mismatch \(0 nested vetoed\): the fork was charged for 24000/u);
         // Spent tokens, so a priced cost row and not a "no model call" zero.
         assert.equal(doc.usage.output_tokens, 120);
         assert.equal(doc.costNote, null);

@@ -21,11 +21,15 @@
  * the fork itself. The row says which path carried it, `via: "seam"` or
  * `via: "hook"`.
  *
- * **It never answers a compaction.** Every `session.compact` dispatch ends in
- * `next(e)`, whatever happened here, so the compaction you already had is what
- * you still get. Every runtime call is wrapped: a throw becomes a field on the
- * row and never an unhandled rejection, because the worst case of installing
- * this must be your own compaction plus a row.
+ * **It never answers a compaction of your conversation.** Every `session.compact`
+ * dispatch ends in `next(e)`, whatever happened here, so the compaction you
+ * already had is what you still get. The single exception is a transcript that
+ * is not yours: the engine compacting a memory fork's own loop while this
+ * plugin is waiting on it, which is refused with `{ skip }` because that
+ * transcript is a copy this plugin made and throws away (#767). Every runtime
+ * call is wrapped: a throw becomes a field on the row and never an unhandled
+ * rejection, because the worst case of installing this must be your own
+ * compaction plus a row.
  *
  * **It never answers a prompt either.** Every `prompt.submit` dispatch ends in
  * `next`, and the context is attached on the way down, which is the only place
@@ -41,6 +45,7 @@
  */
 
 import { projectKey } from "../schema/generation-rows.js";
+import { LATE, nestedForkCompaction, OWN } from "./fork-guard.js";
 import { forkInputOf } from "./fork-input.js";
 import { composeInjection, finalScoreOf, injectionGate, promptLine } from "./inject.js";
 import { paneTree } from "./pane.js";
@@ -117,6 +122,23 @@ const MAX_DETAIL_CHARS = 2000;
 
 /** How long a tool's child may take. Nobody is waiting on a keystroke here. */
 const TOOL_MS = 30_000;
+
+/**
+ * How long after a fork starts a nested compaction is read as that fork's own.
+ *
+ * The twenty-five cold forks measured for #690 were each paired with an
+ * `agentId` compaction arriving 0.061 to 0.433 seconds after the fork; five
+ * seconds is ten times the widest of those. The window is what keeps a genuine
+ * subagent that happens to compact during a long fork from being vetoed with
+ * it: past the window the dispatch is counted and handed on untouched.
+ */
+const NESTED_COMPACT_WINDOW_MS = 5000;
+
+/** Why the engine's compaction of this plugin's own fork loop is refused. */
+const NESTED_SKIP_REASON =
+    "memory-handoff: this is the compaction of a memory fork's own transcript, which is a one-shot " +
+    "completion that is thrown away when it answers. Summarising it would leave the fork reading a " +
+    "summary of this conversation instead of the conversation (#767).";
 
 /** The four tools the model may call, spelled out because a matcher takes a literal. */
 const TOOL_SEARCH = "mcp__memory-handoff__memory_search";
@@ -195,7 +217,20 @@ const freshSession = () => ({
     project: null,
     /** Whether this session has already said the runtime is not installed. Said once, not every prompt. */
     warnedNotInstalled: false,
+    /** The fork the engine must not compact underneath, while one is running. See `forkGuard`. */
+    fork: freshForkGuard(),
 });
+
+/**
+ * What is known about the fork currently in flight, and nothing else.
+ *
+ * `since` is the clock the veto window is measured from, `null` whenever no
+ * fork is running. The two counters are the evidence the next version reads:
+ * `vetoed` is how many nested compactions were refused for this session and
+ * `lateSeen` is how many arrived while a fork was in flight but outside the
+ * window, which is the reading that would say the window is too tight.
+ */
+const freshForkGuard = () => ({ since: null, vetoed: 0, lateSeen: 0 });
 
 let session = freshSession();
 
@@ -367,7 +402,36 @@ export const register = (on, pluginOptions) => {
         return next(e);
     });
 
+    /**
+     * Every other compaction: the fork, unless this is the engine compacting a
+     * fork's own transcript while this plugin is still waiting on it.
+     *
+     * A memory fork copies a conversation that has just tripped the engine's
+     * auto-compaction threshold and appends a prompt to it, so the copy is over
+     * the threshold too and the engine compacts it immediately. The fork then
+     * answers over the engine's summary rather than the conversation, comes
+     * back charged for a third of the context, and `forkInputOf` refuses it
+     * after the money is spent. That is #767, and it is why every cold fork
+     * measured for #690 sat in the 164k-167k band on `trigger: auto`.
+     *
+     * Refusing it is the one case where this module does not end in `next(e)`,
+     * and the transcript it refuses is a copy this plugin made and throws away
+     * when the fork answers. No conversation a person can see compacts
+     * differently, and a genuine subagent is out of the window by construction.
+     */
     on("session.compact", async ($, e, next) => {
+        const nested = nestedForkCompaction(session.fork, e, Date.now(), NESTED_COMPACT_WINDOW_MS);
+
+        if (nested === LATE) {
+            session.fork.lateSeen += 1;
+        }
+
+        if (nested === OWN) {
+            session.fork.vetoed += 1;
+
+            return { skip: NESTED_SKIP_REASON };
+        }
+
         const seam = await safely($, () => $.store.get(SEAM_KEY));
 
         // The seam already carried this one, or is about to. Forking here too
@@ -500,7 +564,16 @@ const generate = async ($, about, via) => {
     }
 
     try {
+        // Opened before the call and closed in `finally`, because the engine
+        // dispatches the fork loop's own compaction while this await is
+        // outstanding. The hook above reads this window and nothing else.
+        const vetoedBefore = session.fork.vetoed;
+
+        session.fork.since = Date.now();
+
         const reply = await $.model.fork({ prompt: GENERATION_PROMPT });
+
+        record.nestedVetoed = session.fork.vetoed - vetoedBefore;
 
         if (reply === null || reply === undefined) {
             return finish($, record, "cold", startedAt);
@@ -542,6 +615,8 @@ const generate = async ($, about, via) => {
         record.detail = String(error).slice(0, MAX_DETAIL_CHARS);
 
         return finish($, record, "threw", startedAt);
+    } finally {
+        session.fork.since = null;
     }
 };
 
@@ -573,6 +648,12 @@ const blankRecord = async ($, about, via) => {
         // Null on every row that never forked: a subagent's compaction, a
         // precompute, a rehearsal and a refused raise have nothing to compare.
         forkInput: null,
+        // How many compactions of this fork's own loop were refused while it
+        // ran, and how many arrived too late in this session to be read as one.
+        // A `mismatch` row carrying a zero here is a cold fork this fix did not
+        // explain, which is the one reading that would reopen #767.
+        nestedVetoed: 0,
+        nestedLateSeen: session.fork.lateSeen,
         replyChars: null,
         parsedRows: null,
         rejectedRows: null,
@@ -723,8 +804,12 @@ const reasonFor = (record) => {
 
     // Named in the reason because the column itself has to say `failed`: this is
     // the only thing in the database that tells a refused fork from a throw.
+    // The veto count rides along because a mismatch with a veto on it and a
+    // mismatch without are two different bugs: the first says the fork loop was
+    // compacted somewhere this plugin cannot see it, the second says the cold
+    // fork never had a nested compaction to begin with.
     if (record.outcome === "mismatch") {
-        return `mismatch: ${record.detail}`.slice(0, 200);
+        return `mismatch (${record.nestedVetoed} nested vetoed): ${record.detail}`.slice(0, 200);
     }
 
     if (record.outcome === "threw") {
