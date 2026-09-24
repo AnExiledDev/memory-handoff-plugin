@@ -165,8 +165,7 @@ baseline.
 - `01-memory-status` asks whether memory is live and where it keeps its data. Δ
   +1.00, which is the cleanest signal in here: without the plugin there is no
   way to answer it at all.
-- `02-list-memories` asks for everything remembered about the project. Δ +0.50,
-  and the shortfall is a real finding rather than noise — see below.
+- `02-list-memories` asks for everything remembered about the project. Δ +1.00 since the discovery tools were pinned out of ToolSearch (it was +0.50 before, a real finding rather than noise; see below).
 - `03-neg-plain-question` asks for 17 × 23. Δ 0.00 on purpose: it is the guard
   that having these tools loaded does not make an agent call them at a prompt
   that has nothing to do with them.
@@ -190,9 +189,9 @@ built-in `MEMORY.md`, and the failing one gave up there without ever asking
 ToolSearch for `memory_list`. So a `tool.describe` hook now pins `memory_list`
 and `memory_search` in the prompt's tool list (`isDeferred: false`), which costs
 about 1,500 characters of schema, roughly 375 tokens, in every prompt;
-`memory_status` and the rest stay behind ToolSearch. The Δ above is the
-measurement taken before either change; it is restated here only once
-`02-list-memories` has been re-run against it, not assumed fixed.
+`memory_status` and the rest stay behind ToolSearch.
+
+**Resolved 2026-09-24**, on Claude Code 2.1.282. With both changes, `02-list-memories` scored 1.00 over four runs (`--ablation none`), and in every trace the first and only tool call was `memory_list`, with no read of `MEMORY.md` and no ToolSearch. The whole suite at two runs per arm then gave `01-memory-status` Δ +1.00, `02-list-memories` Δ +1.00 and `03-neg-plain-question` Δ 0.00, for $0.54: pinning two tools in front did not pull them into the arithmetic prompt.
 
 A negative case is not padding. A plugin that fires on everything is a
 regression this suite is meant to go red on, and `tool_used` with `min: 0`,
