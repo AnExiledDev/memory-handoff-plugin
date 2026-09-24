@@ -179,10 +179,12 @@ project, so I can't read" — without ever trying `memory_list`. The other six
 made the fallback explicitly, one of them narrating it: "Direct filesystem
 access to the memory directory is blocked, but there's a memory-handoff MCP tool
 available for this." The store is reachable only through these tools, and
-nothing in the tool text says so, so roughly one reader in seven is told their
-memories are unreadable when they are one call away. Tracked as a change to the
-tool descriptions rather than fixed blind, because injected text is measured
-against `bench/` and not guessed at.
+nothing in the tool text said so, so roughly one reader in seven was told their
+memories were unreadable when they were one call away. `memory_list`,
+`memory_search` and `memory_status` now each end on that fact, 228 characters
+across the three (740 before, 968 after). The Δ above is the measurement taken
+before that change; it is restated here only once `02-list-memories` has been
+re-run against it, not assumed fixed.
 
 A negative case is not padding. A plugin that fires on everything is a
 regression this suite is meant to go red on, and `tool_used` with `min: 0`,

@@ -1477,7 +1477,8 @@ const registerTools = async ($) => {
         description:
             "What memory-handoff has done: whether it is live, where its database is, whether it is reading " +
             "compactions through compact-handoff's seam or through its own hook, what this session has " +
-            "written, retrieved, injected and spent, and what the whole store holds.",
+            "written, retrieved, injected and spent, and what the whole store holds. " +
+            "The store is reachable only through these memory tools, not the filesystem.",
         inputSchema: { type: "object", properties: {} },
     });
 
@@ -1487,7 +1488,8 @@ const registerTools = async ($) => {
             "Search this project's memories from earlier sessions. Use it when the person refers to something " +
             "decided or discovered before this conversation, or when you want what was already learned about a " +
             "file or a decision. Answers the matching memories with their scores and the id of the trace that " +
-            "explains the ranking.",
+            "explains the ranking. " +
+            "The store is reachable only through these memory tools, not the filesystem.",
         inputSchema: {
             type: "object",
             properties: {
@@ -1519,7 +1521,8 @@ const registerTools = async ($) => {
         name: "memory_list",
         description:
             "This project's memories, newest first, whether or not they match anything. For reviewing what has " +
-            "been remembered; memory_search is what to use when looking for something.",
+            "been remembered; memory_search is what to use when looking for something. " +
+            "The store is reachable only through these memory tools, not the filesystem.",
         inputSchema: {
             type: "object",
             properties: {

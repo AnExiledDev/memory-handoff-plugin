@@ -381,6 +381,27 @@ describe("the tools", () => {
         );
     });
 
+    // One agent in seven globbed the memory directory, was refused, and told the
+    // person their memories were unreadable without ever trying memory_list. A
+    // denial on any path has to point at a tool, so each discovery tool says it.
+    it("says on every discovery tool that the store is reachable only through the tools", async () => {
+        const host = fakeApi();
+
+        await started(host);
+
+        const discovery = host.tools.filter((spec) => ["memory_list", "memory_search", "memory_status"].includes(spec.name));
+
+        assert.equal(discovery.length, 3);
+
+        for (const spec of discovery) {
+            assert.match(spec.description, /reachable only through these memory tools, not the filesystem/u, spec.name);
+        }
+
+        // Every description rides in every prompt: the three came to 740
+        // characters before the fact was added, and it may cost under 300 more.
+        assert.ok(discovery.reduce((sum, spec) => sum + spec.description.length, 0) < 740 + 300);
+    });
+
     it("memory_search parses the child's document and traces the call as a tool", async () => {
         const host = fakeApi();
         const answer = await call(host, "mcp__memory-handoff__memory_search", { query: "cron", k: 3 });
