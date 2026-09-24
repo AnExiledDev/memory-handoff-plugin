@@ -366,6 +366,17 @@ export const register = (on, pluginOptions) => {
         return { result: JSON.stringify((await safely($, () => deleteTool($, e))) ?? THREW, null, 2) };
     });
 
+    // The two discovery tools go in the prompt's list rather than behind
+    // ToolSearch. Deferred, the model sees only their names: an eval run read
+    // the built-in MEMORY.md first, was denied, and gave up without ever loading
+    // memory_list, so the description saying the store is reachable only
+    // through these tools never reached it. The answer is the same every time
+    // because the engine caches it for the session, and a changing one spends
+    // the prompt cache.
+    on("tool.describe", { tool: TOOL_LIST }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }));
+
+    on("tool.describe", { tool: TOOL_SEARCH }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }));
+
     // compact-handoff raising the seam, one compaction before it happens. It
     // never calls `next`: this call exists for this hook and for nothing else,
     // and the answer goes back on compact-handoff's own row.

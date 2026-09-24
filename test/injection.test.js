@@ -402,6 +402,41 @@ describe("the tools", () => {
         assert.ok(discovery.reduce((sum, spec) => sum + spec.description.length, 0) < 740 + 300);
     });
 
+    // Behind ToolSearch the model sees only the names, so the sentence above is
+    // invisible when it matters: a failing eval run read the built-in MEMORY.md,
+    // was denied, and gave up without ever loading memory_list.
+    it("pins memory_list and memory_search in front of ToolSearch, keeping the engine's description", async () => {
+        const runtime = await registered();
+
+        for (const tool of ["mcp__memory-handoff__memory_list", "mcp__memory-handoff__memory_search"]) {
+            const input = { tool, description: "as the engine computed it", isDeferred: true };
+            const next = async (e) => {
+                next.calls.push(e);
+
+                return { description: e.description, isDeferred: true };
+            };
+
+            next.calls = [];
+
+            const answer = await runtime.dispatch("tool.describe", {}, input, next);
+
+            assert.deepEqual(answer, { description: "as the engine computed it", isDeferred: false }, tool);
+            assert.deepEqual(next.calls, [input], tool);
+        }
+    });
+
+    it("leaves every other tool's placement to the engine", async () => {
+        const runtime = await registered();
+
+        for (const tool of ["mcp__memory-handoff__memory_status", "mcp__memory-handoff__memory_explain", "mcp__memory-handoff__before_compact", "Bash"]) {
+            await assert.rejects(
+                runtime.dispatch("tool.describe", {}, { tool, description: "engine", isDeferred: true }, passThrough()),
+                /nothing is registered for tool\.describe/u,
+                tool,
+            );
+        }
+    });
+
     it("memory_search parses the child's document and traces the call as a tool", async () => {
         const host = fakeApi();
         const answer = await call(host, "mcp__memory-handoff__memory_search", { query: "cron", k: 3 });
