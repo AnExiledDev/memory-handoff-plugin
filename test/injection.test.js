@@ -381,6 +381,62 @@ describe("the tools", () => {
         );
     });
 
+    // One agent in seven globbed the memory directory, was refused, and told the
+    // person their memories were unreadable without ever trying memory_list. A
+    // denial on any path has to point at a tool, so each discovery tool says it.
+    it("says on every discovery tool that the store is reachable only through the tools", async () => {
+        const host = fakeApi();
+
+        await started(host);
+
+        const discovery = host.tools.filter((spec) => ["memory_list", "memory_search", "memory_status"].includes(spec.name));
+
+        assert.equal(discovery.length, 3);
+
+        for (const spec of discovery) {
+            assert.match(spec.description, /reachable only through these memory tools, not the filesystem/u, spec.name);
+        }
+
+        // Every description rides in every prompt: the three came to 740
+        // characters before the fact was added, and it may cost under 300 more.
+        assert.ok(discovery.reduce((sum, spec) => sum + spec.description.length, 0) < 740 + 300);
+    });
+
+    // Behind ToolSearch the model sees only the names, so the sentence above is
+    // invisible when it matters: a failing eval run read the built-in MEMORY.md,
+    // was denied, and gave up without ever loading memory_list.
+    it("pins memory_list and memory_search in front of ToolSearch, keeping the engine's description", async () => {
+        const runtime = await registered();
+
+        for (const tool of ["mcp__memory-handoff__memory_list", "mcp__memory-handoff__memory_search"]) {
+            const input = { tool, description: "as the engine computed it", isDeferred: true };
+            const next = async (e) => {
+                next.calls.push(e);
+
+                return { description: e.description, isDeferred: true };
+            };
+
+            next.calls = [];
+
+            const answer = await runtime.dispatch("tool.describe", {}, input, next);
+
+            assert.deepEqual(answer, { description: "as the engine computed it", isDeferred: false }, tool);
+            assert.deepEqual(next.calls, [input], tool);
+        }
+    });
+
+    it("leaves every other tool's placement to the engine", async () => {
+        const runtime = await registered();
+
+        for (const tool of ["mcp__memory-handoff__memory_status", "mcp__memory-handoff__memory_explain", "mcp__memory-handoff__before_compact", "Bash"]) {
+            await assert.rejects(
+                runtime.dispatch("tool.describe", {}, { tool, description: "engine", isDeferred: true }, passThrough()),
+                /nothing is registered for tool\.describe/u,
+                tool,
+            );
+        }
+    });
+
     it("memory_search parses the child's document and traces the call as a tool", async () => {
         const host = fakeApi();
         const answer = await call(host, "mcp__memory-handoff__memory_search", { query: "cron", k: 3 });

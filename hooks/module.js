@@ -366,6 +366,17 @@ export const register = (on, pluginOptions) => {
         return { result: JSON.stringify((await safely($, () => deleteTool($, e))) ?? THREW, null, 2) };
     });
 
+    // The two discovery tools go in the prompt's list rather than behind
+    // ToolSearch. Deferred, the model sees only their names: an eval run read
+    // the built-in MEMORY.md first, was denied, and gave up without ever loading
+    // memory_list, so the description saying the store is reachable only
+    // through these tools never reached it. The answer is the same every time
+    // because the engine caches it for the session, and a changing one spends
+    // the prompt cache.
+    on("tool.describe", { tool: TOOL_LIST }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }));
+
+    on("tool.describe", { tool: TOOL_SEARCH }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }));
+
     // compact-handoff raising the seam, one compaction before it happens. It
     // never calls `next`: this call exists for this hook and for nothing else,
     // and the answer goes back on compact-handoff's own row.
@@ -1477,7 +1488,8 @@ const registerTools = async ($) => {
         description:
             "What memory-handoff has done: whether it is live, where its database is, whether it is reading " +
             "compactions through compact-handoff's seam or through its own hook, what this session has " +
-            "written, retrieved, injected and spent, and what the whole store holds.",
+            "written, retrieved, injected and spent, and what the whole store holds. " +
+            "The store is reachable only through these memory tools, not the filesystem.",
         inputSchema: { type: "object", properties: {} },
     });
 
@@ -1487,7 +1499,8 @@ const registerTools = async ($) => {
             "Search this project's memories from earlier sessions. Use it when the person refers to something " +
             "decided or discovered before this conversation, or when you want what was already learned about a " +
             "file or a decision. Answers the matching memories with their scores and the id of the trace that " +
-            "explains the ranking.",
+            "explains the ranking. " +
+            "The store is reachable only through these memory tools, not the filesystem.",
         inputSchema: {
             type: "object",
             properties: {
@@ -1519,7 +1532,8 @@ const registerTools = async ($) => {
         name: "memory_list",
         description:
             "This project's memories, newest first, whether or not they match anything. For reviewing what has " +
-            "been remembered; memory_search is what to use when looking for something.",
+            "been remembered; memory_search is what to use when looking for something. " +
+            "The store is reachable only through these memory tools, not the filesystem.",
         inputSchema: {
             type: "object",
             properties: {
