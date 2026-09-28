@@ -21,6 +21,8 @@ It never answers a compaction. Every `session.compact` dispatch ends in
 answers a prompt either: a `prompt.submit` always goes down to the next hook,
 with a memory block attached to it or with nothing attached to it.
 
+By the same author: [changelogs.core-directive.com](https://changelogs.core-directive.com), a changelog for every Claude Code release, written from what changed in the build.
+
 ## Install
 
 ```bash
