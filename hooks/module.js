@@ -260,11 +260,16 @@ let options = {};
  * falls through to the variable. Stringified, because the existing parsers
  * below take the text `$.env.get` returns and a declared number or boolean has
  * to read the same way to them.
+ *
+ * The engine hands a declared default over as a set value, so a number's
+ * declared `0` counts as unset here, and no boolean declares a default at all:
+ * a `false` would read as set and hide the variable from everyone who never
+ * opened the menu.
  */
 const opt = (key) => {
     const value = options[key];
 
-    if (value === undefined || value === null || value === "") return undefined;
+    if (value === undefined || value === null || value === "" || value === 0) return undefined;
 
     return String(value).trim() || undefined;
 };

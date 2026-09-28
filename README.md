@@ -1395,12 +1395,7 @@ same way an interactive one is.
 
 ## Settings
 
-Seven of these are also rows in `/plugin`, under this plugin's configuration:
-`live`, `dir`, `sessionBudgetUsd`, `injectK`, `injectMaxEntries`,
-`injectMaxChars` and `injectTimeoutMs`. A row set there wins over the matching
-variable; left empty, the variable is read as it always was, which is what a
-cron line or a one-off shell invocation already sets. The variables below that
-have no row are read from the environment only.
+Seven of these are also rows in `/plugin`, under this plugin's configuration: `live`, `dir`, `sessionBudgetUsd`, `injectK`, `injectMaxEntries`, `injectMaxChars` and `injectTimeoutMs`. A row set there wins over the matching variable; left empty, the variable is read as it always was, which is what a cron line or a one-off shell invocation already sets. A number row at 0 counts as empty, and `live` counts as empty until it is switched either way: switched off, it stays off whatever `MEMORY_HANDOFF_LIVE` says. The variables below that have no row are read from the environment only.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
