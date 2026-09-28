@@ -11,8 +11,7 @@
     "live": {
       "type": "boolean",
       "title": "Live",
-      "description": "Off, every compaction writes a rehearsed row and nothing reaches the model. On, it forks and it injects.",
-      "default": false
+      "description": "Off, every compaction writes a rehearsed row and nothing reaches the model. On, it forks and it injects."
     },
     "dir": {
       "type": "string",
