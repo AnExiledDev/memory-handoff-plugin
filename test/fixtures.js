@@ -263,6 +263,10 @@ const adminAnswer = (argv, options) => {
         return { ok: true, injectionId: 1, retrievalId: doc.retrievalId ?? 1 };
     }
 
+    if (op === "echo") {
+        return { ok: true, injectionId: doc.injectionId, written: (doc.rows ?? []).length, refused: 0 };
+    }
+
     if (op === "counts") {
         return {
             ok: true,

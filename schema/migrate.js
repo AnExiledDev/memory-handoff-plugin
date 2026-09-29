@@ -28,7 +28,7 @@
  */
 
 /** Every migration file, in order. A new one is appended here and nowhere else. */
-export const MIGRATION_FILES = ["001-initial.sql"];
+export const MIGRATION_FILES = ["001-initial.sql", "002-injection-echoes.sql"];
 
 /**
  * The version a migration file's name claims, which is its leading digits.

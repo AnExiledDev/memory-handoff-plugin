@@ -79,7 +79,7 @@ function run() {
     const vector = db.query("SELECT length(vector) AS bytes, dim FROM embeddings WHERE dtype = 'f32'").get();
 
     assert(vector?.bytes === 1536 && vector?.dim === 384, "the f32 vector is 1536 bytes over 384 dimensions");
-    assert(readVersion() === 1, "the database is at schema version 1");
+    assert(readVersion() === 2, "the database is at schema version 2");
     assert(journalMode() === "wal", "the journal mode is wal");
     assert(status(first) === "superseded", "the superseded ancestor is still there, with its new status");
 
