@@ -17,18 +17,20 @@
  * is still 0, because every caller is a hook that must record what happened
  * rather than raise. An unknown op is the same shape.
  *
- * Four ops:
+ * Five ops:
  *
  * - `counts`    what `memory_status` reports: the corpus, the logs, the spend.
  * - `list`      this project's memories, newest first, paged.
  * - `delete`    tombstone by default; `{ "purge": true }` removes the row.
  * - `injection` the `injections` row, and the `retrievals` row for a retrieval
  *               that never answered.
+ * - `echo`      the `injection_echoes` rows for a turn that ended: whether
+ *               each injected memory showed up in what the turn wrote.
  */
 
 import { openMemoryDb, purge, tombstone, withRetry } from "./bun-sqlite.js";
 
-const OPS = ["counts", "list", "delete", "injection"];
+const OPS = ["counts", "list", "delete", "injection", "echo"];
 
 /** How many memories `list` returns when the caller does not say. */
 const DEFAULT_LIMIT = 20;
@@ -100,6 +102,10 @@ const apply = (opened, op, doc) => {
 
     if (op === "delete") {
         return remove(opened, doc);
+    }
+
+    if (op === "echo") {
+        return echo(opened.db, doc);
     }
 
     return injection(opened.db, doc);
@@ -267,6 +273,55 @@ const injection = (db, doc) => {
 
         return { ok: true, injectionId: id, retrievalId };
     })();
+};
+
+/**
+ * Whether each memory an injection carried showed up in the turn it went to.
+ *
+ * One short transaction after the turn has ended, never a lock held across it.
+ * A memory the injection did not carry is refused rather than written, so a
+ * row always means "this memory was in front of the model on that turn". A
+ * pair already scored keeps its first row: `DO NOTHING` rather than
+ * `OR IGNORE`, because `OR IGNORE` would also swallow a CHECK the row failed.
+ */
+const echo = (db, doc) => {
+    const injectionId = integerOr(doc.injectionId, 0);
+    const found = db.query("SELECT memory_ids FROM injections WHERE id = ?").get(injectionId);
+
+    if (found === null || found === undefined) {
+        return { ok: false, reason: `no injection ${injectionId} in this database` };
+    }
+
+    const carried = new Set(JSON.parse(found.memory_ids).map(Number));
+    const rows = Array.isArray(doc.rows) ? doc.rows : [];
+    const wanted = rows.filter((row) => carried.has(integerOr(row?.memoryId, 0)));
+    const at = typeof doc.at === "string" ? doc.at : new Date().toISOString();
+    const statement = db.query(
+        `INSERT INTO injection_echoes (injection_id, memory_id, at, turn_id, verdict, distinct_terms, echoed_terms, echoed, written_chars)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (injection_id, memory_id) DO NOTHING`,
+    );
+
+    const written = db.transaction(() =>
+        wanted.reduce(
+            (sum, row) =>
+                sum +
+                statement.run(
+                    injectionId,
+                    integerOr(row.memoryId, 0),
+                    at,
+                    typeof doc.turnId === "string" ? doc.turnId : null,
+                    String(row.verdict),
+                    integerOr(row.distinctTerms, 0),
+                    integerOr(row.echoedTerms, 0),
+                    JSON.stringify(Array.isArray(row.echoed) ? row.echoed : []),
+                    integerOr(doc.writtenChars, 0),
+                ).changes,
+            0,
+        ),
+    )();
+
+    return { ok: true, injectionId, written, refused: rows.length - wanted.length };
 };
 
 /** The trace for a retrieval that never answered, so the injection has something to point at. */

@@ -22,6 +22,7 @@ const TABLES = [
     "costs",
     "embeddings",
     "generations",
+    "injection_echoes",
     "injections",
     "memories",
     "memories_fts",
@@ -98,16 +99,16 @@ describe("the schema applies to an empty file", () => {
         });
     });
 
-    it("ends at schema version 1", () => {
+    it("ends at schema version 2", () => {
         withDb(({ exec, migrated }) => {
-            assert.equal(readVersion(exec), 1);
-            assert.deepEqual(migrated, { from: 0, to: 1, applied: ["001-initial.sql"] });
+            assert.equal(readVersion(exec), 2);
+            assert.deepEqual(migrated, { from: 0, to: 2, applied: ["001-initial.sql", "002-injection-echoes.sql"] });
         });
     });
 
     it("applies nothing the second time", () => {
         withDb(({ exec }) => {
-            assert.deepEqual(migrate(exec, readMigrations()), { from: 1, to: 1, applied: [] });
+            assert.deepEqual(migrate(exec, readMigrations()), { from: 2, to: 2, applied: [] });
         });
     });
 
@@ -365,6 +366,142 @@ describe("a retrieval keeps every candidate it considered", () => {
 
             assert.equal(count(db, "memories"), 2);
             assert.deepEqual(matches(db, "checkout"), [kept]);
+        });
+    });
+});
+
+describe("whether an injected memory showed up is kept per injection and memory", () => {
+    /** A retrieval and an injection of `memoryIds` against it; answers the injection's id. */
+    const injected = (db, memoryIds) => {
+        db.query(
+            `INSERT INTO retrievals (at, origin, query_text, query_source, filters, k, returned_n)
+             VALUES (?, 'prompt', 'what pulls the checkout', 'raw-prompt', '{}', 5, ?)`,
+        ).run(NOW, memoryIds.length);
+
+        const retrievalId = db.query("SELECT last_insert_rowid() AS id").get().id;
+
+        db.query(
+            `INSERT INTO injections (retrieval_id, at, memory_ids, entries, chars, approx_tokens, cap_chars, cap_entries)
+             VALUES (?, ?, ?, ?, 120, 30, 4000, 5)`,
+        ).run(retrievalId, NOW, JSON.stringify(memoryIds), memoryIds.length);
+
+        return db.query("SELECT last_insert_rowid() AS id").get().id;
+    };
+
+    const insertEcho = (db, injectionId, memoryId, row = {}) =>
+        db
+            .query(
+                `INSERT INTO injection_echoes (injection_id, memory_id, at, turn_id, verdict, distinct_terms, echoed_terms, echoed, written_chars)
+                 VALUES (?, ?, ?, 'turn-1', ?, ?, ?, ?, 400)`,
+            )
+            .run(injectionId, memoryId, NOW, row.verdict ?? "echoed", row.distinctTerms ?? 6, row.echoedTerms ?? 4, row.echoed ?? '["flock"]');
+
+    /** A store built by the first migration alone, the shape every install before this one has on disk. */
+    const withV1Store = (run) => {
+        const dir = mkdtempSync(join(tmpdir(), "memory-handoff-v1-"));
+        const db = new Database(join(dir, "memory.sqlite"), { create: true });
+        const exec = { run: (sql) => db.exec(sql), get: (sql) => db.query(sql).get() ?? undefined };
+
+        try {
+            db.exec("PRAGMA foreign_keys = ON");
+            migrate(exec, readMigrations().filter((migration) => migration.version === 1));
+
+            return run({ db, exec });
+        } finally {
+            db.close();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    };
+
+    it("migrates a version 1 store with rows to version 2 and keeps every row", () => {
+        withV1Store(({ db, exec }) => {
+            const memoryId = insertMemory(db);
+            const injectionId = injected(db, [memoryId]);
+
+            assert.equal(readVersion(exec), 1);
+            assert.deepEqual(migrate(exec, readMigrations()), { from: 1, to: 2, applied: ["002-injection-echoes.sql"] });
+            assert.equal(count(db, "memories"), 1);
+            assert.equal(count(db, "injections"), 1);
+            // Nothing is backfilled: an injection from before the signal existed
+            // has no row, which the README's query reads as unknown.
+            assert.equal(count(db, "injection_echoes"), 0);
+
+            insertEcho(db, injectionId, memoryId);
+
+            assert.equal(count(db, "injection_echoes"), 1);
+        });
+    });
+
+    it("is idempotent on a store with rows: a second run applies nothing and the file itself re-runs clean", () => {
+        withV1Store(({ db, exec }) => {
+            const memoryId = insertMemory(db);
+            const injectionId = injected(db, [memoryId]);
+
+            migrate(exec, readMigrations());
+            insertEcho(db, injectionId, memoryId);
+
+            assert.deepEqual(migrate(exec, readMigrations()), { from: 2, to: 2, applied: [] });
+
+            exec.run(readMigrations().find((migration) => migration.version === 2).sql);
+
+            assert.equal(readVersion(exec), 2);
+            assert.equal(count(db, "injection_echoes"), 1);
+            assert.equal(count(db, "injections"), 1);
+        });
+    });
+
+    // The memory is immutable past its status, so the signal cannot live on
+    // it; and a memory someone removed is still a memory that was injected.
+    it("survives the memory being superseded, tombstoned and purged", () => {
+        withDb(({ db, exec }) => {
+            const superseded = insertMemory(db, { uuid: "u-old" });
+            const removed = insertMemory(db, { uuid: "u-gone" });
+            const injectionId = injected(db, [superseded, removed]);
+
+            insertEcho(db, injectionId, superseded);
+            insertEcho(db, injectionId, removed, { verdict: "silent", echoedTerms: 0 });
+            insertMemory(db, { uuid: "u-new", supersedes: superseded });
+            db.query("UPDATE memories SET status = 'superseded' WHERE id = ?").run(superseded);
+            tombstone(exec, removed);
+            purge(exec, removed);
+
+            assert.equal(count(db, "memories"), 2);
+            assert.deepEqual(db.query("SELECT memory_id, verdict FROM injection_echoes ORDER BY memory_id").all(), [
+                { memory_id: superseded, verdict: "echoed" },
+                { memory_id: removed, verdict: "silent" },
+            ]);
+        });
+    });
+
+    it("keeps one row per injection and memory", () => {
+        withDb(({ db }) => {
+            const memoryId = insertMemory(db);
+            const injectionId = injected(db, [memoryId]);
+
+            insertEcho(db, injectionId, memoryId);
+
+            assert.throws(() => insertEcho(db, injectionId, memoryId, { verdict: "silent", echoedTerms: 0 }), /UNIQUE|PRIMARY KEY/u);
+        });
+    });
+
+    for (const [what, row] of [
+        ["a verdict outside the vocabulary", { verdict: "useful" }],
+        ["more words echoed than the memory had", { distinctTerms: 2, echoedTerms: 3 }],
+        ["a sample that is not JSON", { echoed: "flock" }],
+    ]) {
+        it(`refuses ${what}`, () => {
+            withDb(({ db }) => {
+                const memoryId = insertMemory(db);
+                const injectionId = injected(db, [memoryId]);
+
+                assert.throws(() => insertEcho(db, injectionId, memoryId, row), /CHECK/u);
+            });
+        });
+    }
+
+    it("refuses a row for an injection that does not exist", () => {
+        withDb(({ db }) => {
+            assert.throws(() => insertEcho(db, 999, 1), /FOREIGN KEY/u);
         });
     });
 });

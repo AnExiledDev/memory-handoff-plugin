@@ -275,6 +275,105 @@ describe("memory-admin injection", () => {
     });
 });
 
+describe("memory-admin echo", () => {
+    /** An injection of `memoryIds`, recorded the way the hook records one; answers its id. */
+    const injectedWith = (admin, memoryIds) => {
+        const failed = admin("injection", {
+            sessionId: "s1",
+            failure: { query: "why did the cron job stop", project: PROJECT, k: 5, reason: "timed out after 1500ms" },
+        });
+
+        return admin("injection", { retrievalId: failed.retrievalId, sessionId: "s1", memoryIds }).injectionId;
+    };
+
+    const echoDoc = (injectionId, rows) => ({ injectionId, turnId: "turn-1", at: "2026-09-29T12:00:00Z", writtenChars: 900, rows });
+
+    const row = (memoryId, verdict = "echoed") => ({
+        memoryId,
+        verdict,
+        distinctTerms: 6,
+        echoedTerms: verdict === "echoed" ? 4 : 0,
+        echoed: verdict === "echoed" ? ["hang", "mode", "staging", "tl"] : [],
+    });
+
+    it("records one row per memory the injection carried, keyed to both", () => {
+        withAdmin(({ admin, read, ids }) => {
+            const injectionId = injectedWith(admin, ids);
+            const answer = admin("echo", echoDoc(injectionId, [row(ids[0]), row(ids[1], "silent")]));
+
+            assert.deepEqual(answer, { ok: true, injectionId, written: 2, refused: 0 });
+
+            const rows = read("SELECT * FROM injection_echoes ORDER BY memory_id");
+
+            assert.deepEqual(
+                rows.map((found) => [found.injection_id, found.memory_id, found.verdict, found.turn_id, found.written_chars]),
+                [
+                    [injectionId, ids[0], "echoed", "turn-1", 900],
+                    [injectionId, ids[1], "silent", "turn-1", 900],
+                ],
+            );
+            assert.deepEqual(JSON.parse(rows[0].echoed), ["hang", "mode", "staging", "tl"]);
+        });
+    });
+
+    // A turn is scored once. A second report for the same pair, from a retry
+    // or a replayed hook, must not overwrite the first or fail the call.
+    it("keeps the first row when the same pair is reported twice", () => {
+        withAdmin(({ admin, read, ids }) => {
+            const injectionId = injectedWith(admin, ids);
+
+            admin("echo", echoDoc(injectionId, [row(ids[0])]));
+
+            const again = admin("echo", echoDoc(injectionId, [row(ids[0], "silent")]));
+
+            assert.equal(again.ok, true);
+            assert.equal(again.written, 0);
+            assert.deepEqual(read("SELECT verdict FROM injection_echoes"), [{ verdict: "echoed" }]);
+        });
+    });
+
+    it("refuses a memory the injection did not carry", () => {
+        withAdmin(({ admin, read, ids }) => {
+            const injectionId = injectedWith(admin, [ids[0]]);
+            const answer = admin("echo", echoDoc(injectionId, [row(ids[0]), row(ids[1])]));
+
+            assert.equal(answer.written, 1);
+            assert.equal(answer.refused, 1);
+            assert.deepEqual(read("SELECT memory_id FROM injection_echoes"), [{ memory_id: ids[0] }]);
+        });
+    });
+
+    it("writes nothing for an injection that carried nothing", () => {
+        withAdmin(({ admin, read, ids }) => {
+            const injectionId = injectedWith(admin, []);
+            const answer = admin("echo", echoDoc(injectionId, [row(ids[0])]));
+
+            assert.equal(answer.written, 0);
+            assert.deepEqual(read("SELECT * FROM injection_echoes"), []);
+        });
+    });
+
+    it("refuses an injection that does not exist, as a value", () => {
+        withAdmin(({ admin, read, ids }) => {
+            const answer = admin("echo", echoDoc(999, [row(ids[0])]));
+
+            assert.equal(answer.ok, false);
+            assert.match(answer.reason, /no injection 999/u);
+            assert.deepEqual(read("SELECT * FROM injection_echoes"), []);
+        });
+    });
+
+    it("refuses a row the schema cannot mean, as a value, and writes none of the call", () => {
+        withAdmin(({ admin, read, ids }) => {
+            const injectionId = injectedWith(admin, ids);
+            const answer = admin("echo", echoDoc(injectionId, [row(ids[0]), { ...row(ids[1]), verdict: "useful" }]));
+
+            assert.equal(answer.ok, false);
+            assert.deepEqual(read("SELECT * FROM injection_echoes"), []);
+        });
+    });
+});
+
 describe("memory-admin refuses the calls it cannot make, as values", () => {
     it("names the ops it has when handed one it does not", () => {
         withAdmin(({ admin }) => {

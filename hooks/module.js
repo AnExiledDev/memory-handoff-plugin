@@ -46,6 +46,7 @@
 
 import { projectKey } from "../schema/generation-rows.js";
 import { LATE, nestedForkCompaction, OWN } from "./fork-guard.js";
+import { echoOf, turnWriting } from "./echo.js";
 import { forkInputOf } from "./fork-input.js";
 import { composeInjection, finalScoreOf, injectionGate, promptLine } from "./inject.js";
 import { paneTree } from "./pane.js";
@@ -219,6 +220,8 @@ const freshSession = () => ({
     warnedNotInstalled: false,
     /** The fork the engine must not compact underneath, while one is running. See `forkGuard`. */
     fork: freshForkGuard(),
+    /** The memories the current turn was handed, until its end is scored. See `pendingEcho`. */
+    echo: null,
 });
 
 /**
@@ -311,16 +314,48 @@ export const register = (on, pluginOptions) => {
      * between the person's Enter and their turn is the one bounded child.
      */
     on("prompt.submit", async ($, e, next) => {
+        if (startsATurn(e)) {
+            session.echo = null;
+        }
+
         const plan = await safely($, () => planInjection($, e));
 
         if (plan === null) {
             return next(e);
         }
 
-        const answer = await next(plan.block === null ? e : { ...e, context: [...(e.context ?? []), plan.block] });
+        const echo = pendingEcho(plan);
 
-        await safely($, () => recordInjection($, plan));
+        session.echo = echo;
+
+        const answer = await next(plan.block === null ? e : { ...e, context: [...(e.context ?? []), plan.block] });
+        const written = await safely($, () => recordInjection($, plan));
+
+        await safely($, () => settleEcho($, echo, written));
         await safely($, () => showPane($));
+
+        return answer;
+    });
+
+    /**
+     * The turn the memories went to, by id.
+     *
+     * `turn.start` fires inside `prompt.submit`'s `next`, so the first one after
+     * an injection is that prompt's turn. A subagent raises none.
+     */
+    on("turn.start", async ($, e, next) => {
+        if (session.echo !== null && session.echo.turnId === null && typeof e?.turnId === "string") {
+            session.echo.turnId = e.turnId;
+        }
+
+        return next(e);
+    });
+
+    /** Whether each memory the turn was handed showed up in what it wrote. See `hooks/echo.js`. */
+    on("turn.complete", async ($, e, next) => {
+        const answer = await next(e);
+
+        await safely($, () => scoreTurn($, e));
 
         return answer;
     });
@@ -1122,6 +1157,99 @@ const recordInjection = async ($, plan) => {
     });
 
     return written;
+};
+
+/* -------------------------------------------------------------- usefulness */
+
+/**
+ * Whether a submission begins a turn of its own. A prompt carrying a turn id
+ * was delivered into one already running, and the memories that turn was
+ * handed are still the ones to score.
+ */
+const startsATurn = (e) => !(typeof e?.turnId === "string" && e.turnId !== "");
+
+/**
+ * What a turn that was handed memories has to be scored against, or `null`
+ * when it was handed none: a rehearsal, a failed retrieval and an empty one
+ * record nothing, because there was nothing in front of the model to echo.
+ *
+ * `injection` is `pending` until `prompt.submit` has written the row, and the
+ * turn may end before that; whichever of the two finishes second writes the
+ * score, so neither ever waits on the other and no lock spans the turn.
+ */
+const pendingEcho = (plan) => {
+    if (plan.disposition !== "injected" || plan.chosen.length === 0) {
+        return null;
+    }
+
+    return {
+        query: plan.query,
+        entries: plan.chosen.map((entry) => ({ memoryId: entry.memoryId, title: entry.title, body: entry.body })),
+        turnId: null,
+        injection: { state: "pending" },
+        scored: null,
+    };
+};
+
+/** The injection row is written: its id is what the score is keyed to, and a turn already scored is written now. */
+const settleEcho = async ($, echo, written) => {
+    if (echo === null) {
+        return;
+    }
+
+    echo.injection = Number.isInteger(written?.injectionId) ? { state: "recorded", id: written.injectionId } : { state: "unrecorded" };
+
+    if (echo.scored !== null) {
+        await writeEcho($, echo);
+    }
+};
+
+/**
+ * The end of the turn the memories went to, scored.
+ *
+ * Only an answered turn is: an interrupted, refused or failed one wrote part of
+ * what it would have, and scoring it would read silence into a turn nobody saw
+ * finish. It records nothing, which the query reads as unknown.
+ */
+const scoreTurn = async ($, e) => {
+    const echo = session.echo;
+
+    if (echo === null || echo.turnId === null || echo.turnId !== e?.turnId || isSubagent(e)) {
+        return;
+    }
+
+    session.echo = null;
+
+    if (e.reason !== "answer") {
+        return;
+    }
+
+    const writing = turnWriting(await safely($, () => $.session.messages()), e.answer);
+
+    if (writing.trim() === "") {
+        return;
+    }
+
+    echo.scored = {
+        at: new Date().toISOString(),
+        turnId: e.turnId,
+        writtenChars: writing.length,
+        rows: echo.entries.map((entry) => ({ memoryId: entry.memoryId, ...echoOf(entry, echo.query, writing) })),
+    };
+
+    if (echo.injection.state !== "pending") {
+        await writeEcho($, echo);
+    }
+};
+
+const isSubagent = (e) => typeof e?.agentId === "string" && e.agentId !== "";
+
+const writeEcho = async ($, echo) => {
+    if (echo.injection.state !== "recorded") {
+        return;
+    }
+
+    await adminCall($, "echo", { injectionId: echo.injection.id, ...echo.scored });
 };
 
 /** The pane's list: newest first, and short, because it is a view and not the log. */

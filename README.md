@@ -410,7 +410,7 @@ may delete. It is opened in WAL mode with `foreign_keys` on and a 5000 ms busy
 timeout, because two sessions can compact in the same minute and both of them
 have to be able to write.
 
-The schema is `schema/001-initial.sql` and nine tables:
+The schema is `schema/001-initial.sql` plus the migrations after it, and ten tables:
 
 - `schema_meta`, one row, the schema version the file is at.
 - `memories`, the memories themselves and the metadata every filter reads.
@@ -427,6 +427,7 @@ The schema is `schema/001-initial.sql` and nine tables:
   ones it threw away and why.
 - `injections`, what was actually put in front of the model, and what was
   dropped or clipped to fit.
+- `injection_echoes`, from `schema/002-injection-echoes.sql`, one row per memory per injected turn that was scored, saying whether that memory's words came back in what the turn wrote. See "Whether a memory was any use", under Injection.
 
 **The project key is the git remote URL, normalised.** `git@host:owner/repo.git`
 and `https://host/owner/repo(.git)` both become `host/owner/repo`, lowercase
@@ -1395,6 +1396,59 @@ logged rather than swallowed. Retrieval, injection and every tool work
 normally: a headless session with a populated database is handed memories the
 same way an interactive one is.
 
+### Whether a memory was any use
+
+Every turn that was handed memories and answered gets one row per memory in `injection_echoes`, keyed on the injection and the memory, saying whether that memory's words came back in what the model wrote during the turn. The words that count are the memory's own, four letters or longer, minus a short stopword list and minus every word the prompt already carried, because a memory that repeats the question proves nothing when the answer repeats it too. What the model wrote is the final answer plus the text and the tool arguments of every assistant message since the prompt, so a memory the model acted on in a Bash command counts before it ever reaches the answer. Tool results are left out, since those are what a file or a command said.
+
+Three of those words coming back make the row `echoed` (all of them, for a memory that has fewer than three), fewer make it `silent`, and a memory with no word the prompt lacked is `indistinct`, because nothing it could add would be visible. The row keeps up to twelve of the words that came back, in `echoed`, so you can read why it scored the way it did. The rules are in `hooks/echo.js`.
+
+**This signal was picked because it costs nothing.** There's no model call, and a model call on every prompt is paid on every prompt. It also records the silent turns as well as the echoed ones, which is what makes silence countable in the first place. A tool the model calls to say a memory helped would only record the times it remembered to call it, and it would be self-assessment: the model grading its own use of what it was given. This signal is never model-reported, so it has neither problem, and it has the ones below instead.
+
+**An echo is a proxy for use.** A memory that shares three words with the answer by coincidence reads `echoed`. A memory the model read and then argued against reads `echoed` too, because contradicting it means writing its words. A memory that steered the turn away from a mistake without its words ever being written reads `silent`. And if the model reads a file that holds the same words and writes them back, the memory gets credit the file earned. One row says very little. A count says more: a memory `silent` in twenty turns out of twenty is one nobody is using.
+
+**No row means unknown, and it never means unhelpful.** Every injection written before migration 002 has none, so a memory injected fourteen times before the upgrade reads as fourteen unknowns, which says nothing either way about whether it helped. Turns that injected nothing record nothing, and a few that did inject record nothing either. The first kind never shows up as an injection, and the query below reads the second kind as unknown:
+
+- `MEMORY_HANDOFF_LIVE` off records nothing. Nothing reached the model, so there's nothing to echo, and the rehearsed `injections` row carries no memory ids, so those prompts don't count as injections at all.
+- `MEMORY_HANDOFF_INJECT` off, a retrieval that failed and one that found nothing record nothing, for the same reason.
+- A turn that ended `aborted`, `error` or `refusal` records nothing. It wrote part of what it would have, and silence there would be read as a verdict nobody observed.
+- A turn that wrote nothing at all, a subagent's turn (the main loop's turn is still scored), and a session that died before its turn ended record nothing.
+- An injection whose own `injections` row failed to write records nothing, because there's no id to key the score on.
+
+**The record outlives the memory.** `memory_id` carries no foreign key, for the same reason `injections.memory_ids` carries none, so superseding, tombstoning or purging a memory leaves its rows where they are. Nothing is written to `memories`, which stays immutable past its status. The write is one short `memory-admin.js echo` transaction after the turn ends, and no lock is held across the turn: the prompt's `injections` row and the turn's end can land in either order, and whichever lands second writes the score. It does cost one more admin child after every injected turn that answered.
+
+This query lists every memory with how often it was injected and how each of those injections scored. `injected` at 0 is a memory that was never handed to a turn, which is a retrieval question. `echoed` at 0 with `silent` above 0 is a memory that was handed out and came back in no turn that scored it. `unknown` is the injections nothing scored.
+
+```sql
+WITH injected AS (
+  SELECT i.id AS injection_id, CAST(j.value AS INTEGER) AS memory_id
+    FROM injections i, json_each(i.memory_ids) j
+)
+SELECT m.id, m.status, substr(m.title, 1, 40) AS title,
+       count(inj.injection_id) AS injected,
+       coalesce(sum(e.verdict = 'echoed'), 0) AS echoed,
+       coalesce(sum(e.verdict = 'silent'), 0) AS silent,
+       coalesce(sum(e.verdict = 'indistinct'), 0) AS indistinct,
+       count(inj.injection_id) - count(e.injection_id) AS unknown
+  FROM memories m
+  LEFT JOIN injected inj ON inj.memory_id = m.id
+  LEFT JOIN injection_echoes e ON e.injection_id = inj.injection_id AND e.memory_id = inj.memory_id
+ GROUP BY m.id
+ ORDER BY injected DESC, m.id;
+```
+
+Against a synthetic store, two injections from before the migration, four scored turns and one aborted turn:
+
+```
+id  status  title                                     injected  echoed  silent  indistinct  unknown
+--  ------  ----------------------------------------  --------  ------  ------  ----------  -------
+1   active  the staging psql needs a TLS mode set     5         2       1       0           2
+3   active  replica lag on the staging postgres       4         0       3       0           1
+2   active  one fix per pull request                  3         0       1       1           1
+4   active  the monitor lock clears after ninety min  0         0       0       0           0
+```
+
+Memory 1 came back in two of the three turns that scored it. Memory 3 went to four turns and came back in none of the three that scored. Memory 2's one `indistinct` is a turn whose prompt already carried every word it had. Memory 4 was never handed to a turn at all.
+
 ## Settings
 
 Seven of these are also rows in `/plugin`, under this plugin's configuration: `live`, `dir`, `sessionBudgetUsd`, `injectK`, `injectMaxEntries`, `injectMaxChars` and `injectTimeoutMs`. A row set there wins over the matching variable; left empty, the variable is read as it always was, which is what a cron line or a one-off shell invocation already sets. A number row at 0 counts as empty, and `live` counts as empty until it is switched either way: switched off, it stays off whatever `MEMORY_HANDOFF_LIVE` says. The variables below that have no row are read from the environment only.
@@ -1465,6 +1519,8 @@ picks its own `k`, cuts on its own budget and happens inside a live session, so
 make. `bench/verify-injection.py` checks that the block arrives, not that it was
 worth arriving.
 
+What a live session does with what it was given is now recorded, as an echo of each memory's words in the turn it went to, under "Whether a memory was any use". Nothing re-ranks or prunes on it yet.
+
 ## Known limits
 
 - The generation prompt is graded against one synthetic fixture, twice, on one
@@ -1496,6 +1552,7 @@ worth arriving.
   nothing here can hide it. The engine will not raise a tool it has never been
   told about, and `$.tool.register` has no option for a tool the model cannot
   see. The cost is one line of tool listing; the guard is the deny rule above.
+- The usefulness signal is an echo of a memory's words, so it counts a coincidental overlap and a contradiction as use and misses a memory that shaped a turn without being quoted. Injections from before migration 002 are unscored, and read as unknown.
 - Nothing prunes `~/.claude/memory-handoff/`. It grows by one row and one small
   JSON file per compaction, forever, until you delete it.
 - The runtime is 161.6 MB of weights you have to download yourself. The daemon
