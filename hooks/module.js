@@ -46,7 +46,7 @@
 
 import { projectKey } from "../schema/generation-rows.js";
 import { LATE, nestedForkCompaction, OWN } from "./fork-guard.js";
-import { echoOf, turnWriting } from "./echo.js";
+import { echoesOf, turnWriting } from "./echo.js";
 import { forkInputOf } from "./fork-input.js";
 import { composeInjection, finalScoreOf, injectionGate, promptLine } from "./inject.js";
 import { paneTree } from "./pane.js";
@@ -329,6 +329,12 @@ export const register = (on, pluginOptions) => {
         session.echo = echo;
 
         const answer = await next(plan.block === null ? e : { ...e, context: [...(e.context ?? []), plan.block] });
+
+        // A hook beneath refused the prompt: no turn was handed these memories.
+        if (answer?.drop !== undefined && session.echo === echo) {
+            session.echo = null;
+        }
+
         const written = await safely($, () => recordInjection($, plan));
 
         await safely($, () => settleEcho($, echo, written));
@@ -340,11 +346,14 @@ export const register = (on, pluginOptions) => {
     /**
      * The turn the memories went to, by id.
      *
-     * `turn.start` fires inside `prompt.submit`'s `next`, so the first one after
-     * an injection is that prompt's turn. A subagent raises none.
+     * Bound only to a turn that proceeds with the prompt the memories went down
+     * with. Being the next `turn.start` is not enough: a notification that
+     * arrived during the retrieval starts its turn first, and a continuation
+     * starts one with no prompt at all. A turn a hook rewrote goes unmatched
+     * and so unscored, which the query reads as unknown. A subagent raises none.
      */
     on("turn.start", async ($, e, next) => {
-        if (session.echo !== null && session.echo.turnId === null && typeof e?.turnId === "string") {
+        if (isTheInjectedTurn(session.echo, e)) {
             session.echo.turnId = e.turnId;
         }
 
@@ -1191,6 +1200,15 @@ const pendingEcho = (plan) => {
     };
 };
 
+/** Whether a starting turn is the one the pending memories went down with: unbound, and proceeding with their prompt. */
+const isTheInjectedTurn = (echo, e) =>
+    echo !== null &&
+    echo.turnId === null &&
+    typeof e?.turnId === "string" &&
+    typeof e?.text === "string" &&
+    e.text.trim() !== "" &&
+    e.text.trim() === echo.query;
+
 /** The injection row is written: its id is what the score is keyed to, and a turn already scored is written now. */
 const settleEcho = async ($, echo, written) => {
     if (echo === null) {
@@ -1234,7 +1252,7 @@ const scoreTurn = async ($, e) => {
         at: new Date().toISOString(),
         turnId: e.turnId,
         writtenChars: writing.length,
-        rows: echo.entries.map((entry) => ({ memoryId: entry.memoryId, ...echoOf(entry, echo.query, writing) })),
+        rows: echoesOf(echo.entries, echo.query, writing),
     };
 
     if (echo.injection.state !== "pending") {

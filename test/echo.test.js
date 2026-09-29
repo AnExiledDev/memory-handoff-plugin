@@ -116,6 +116,32 @@ describe("what the turn wrote", () => {
         assert.ok(writing.includes("The final answer."));
     });
 
+    // MultiEdit's edits, TodoWrite's todos and most MCP tools carry what the
+    // model wrote in lists and nested objects, not in a top-level string.
+    it("reads tool arguments at any depth", () => {
+        const nested = [
+            { role: "user", text: "fix it", toolUses: [] },
+            {
+                role: "assistant",
+                text: "",
+                toolUses: [
+                    {
+                        tool_use_id: "t1",
+                        tool: "MultiEdit",
+                        input: { file_path: "a.js", edits: [{ old_string: "OLDWORD", new_string: "NEWWORD" }] },
+                    },
+                    { tool_use_id: "t2", tool: "TodoWrite", input: { todos: [{ content: "TODOWORD", status: "pending" }] } },
+                    { tool_use_id: "t3", tool: "mcp__x__y", input: { spec: { deep: { deeper: ["MCPWORD"] } } } },
+                ],
+            },
+        ];
+        const writing = turnWriting(nested, "");
+
+        for (const word of ["OLDWORD", "NEWWORD", "TODOWORD", "MCPWORD", "a.js"]) {
+            assert.ok(writing.includes(word), word);
+        }
+    });
+
     // A file the model read is not something the model wrote.
     it("leaves out tool results and the prompt itself", () => {
         const writing = turnWriting(messages, "");

@@ -255,6 +255,79 @@ describe("a turn records nothing when there is nothing honest to record", () => 
         assert.equal(host.adminDocs("echo").length, 0);
     });
 
+    // A settings hook beneath refused the prompt, so no turn got the memories.
+    // A continuation turn starts later with no prompt of its own.
+    it("does not score a dropped prompt's memories against a later turn that had no prompt", async () => {
+        const host = fakeApi({ search: SEARCH });
+        const runtime = await started(host);
+
+        await runtime.dispatch("prompt.submit", host.$, promptInput(), async () => ({ drop: "blocked by a settings hook" }));
+        await runtime.dispatch("turn.start", host.$, { text: "", turnId: "turn-9" }, passThrough());
+        await runtime.dispatch("turn.complete", host.$, completed({ turnId: "turn-9" }), passThrough());
+
+        assert.equal(host.adminDocs("echo").length, 0);
+    });
+
+    it("does not score a dropped prompt's memories even against a turn carrying the same words", async () => {
+        const host = fakeApi({ search: SEARCH });
+        const runtime = await started(host);
+
+        await runtime.dispatch("prompt.submit", host.$, promptInput(), async () => ({ drop: "blocked by a settings hook" }));
+        await runtime.dispatch("turn.start", host.$, { text: promptInput().text, turnId: "turn-9" }, passThrough());
+        await runtime.dispatch("turn.complete", host.$, completed({ turnId: "turn-9" }), passThrough());
+
+        assert.equal(host.adminDocs("echo").length, 0);
+    });
+
+    // A task notification lands while the person's prompt is still retrieving:
+    // its turn starts first, and the person's prompt is queued behind it.
+    it("does not score a notification's turn that started while the prompt was retrieving", async () => {
+        let runtime = null;
+        const host = fakeApi({
+            search: async () => {
+                await runtime.dispatch(
+                    "prompt.submit",
+                    host.$,
+                    promptInput({ text: "<task-notification>build finished</task-notification>", origin: { kind: "task-notification" } }),
+                    passThrough(),
+                );
+
+                return { exitCode: 0, stdout: `${JSON.stringify(SEARCH)}\n`, stderr: "" };
+            },
+        });
+
+        runtime = await started(host);
+
+        await runtime.dispatch("prompt.submit", host.$, promptInput(), passThrough());
+        await runtime.dispatch("turn.start", host.$, { text: "<task-notification>build finished</task-notification>", turnId: "turn-n" }, passThrough());
+        await runtime.dispatch("turn.complete", host.$, completed({ turnId: "turn-n" }), passThrough());
+
+        assert.equal(host.adminDocs("echo").length, 0);
+
+        await runtime.dispatch("turn.start", host.$, { text: promptInput().text, turnId: "turn-1" }, passThrough());
+        await runtime.dispatch("turn.complete", host.$, completed(), passThrough());
+
+        assert.equal(host.adminDocs("echo").length, 1);
+        assert.equal(host.adminDocs("echo")[0].turnId, "turn-1");
+    });
+
+    // A hook beneath that rewrote the prompt leaves nothing to match the turn
+    // on, and an unmatched turn is unknown, the safe direction.
+    it("leaves a turn whose text is not the prompt the memories went with alone", async () => {
+        const host = fakeApi({ search: SEARCH });
+        const runtime = await started(host);
+        const rewritten = async (input) => {
+            await runtime.dispatch("turn.start", host.$, { text: `${input.text} (rewritten)`, turnId: "turn-1" }, passThrough());
+
+            return { passedThrough: true };
+        };
+
+        await runtime.dispatch("prompt.submit", host.$, promptInput(), rewritten);
+        await runtime.dispatch("turn.complete", host.$, completed(), passThrough());
+
+        assert.equal(host.adminDocs("echo").length, 0);
+    });
+
     // An injection whose turn never started must not be scored against the
     // next turn, which was handed nothing.
     it("does not carry memories over to the next prompt's turn", async () => {

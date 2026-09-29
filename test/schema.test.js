@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -504,7 +504,47 @@ describe("whether an injected memory showed up is kept per injection and memory"
             assert.throws(() => insertEcho(db, 999, 1), /FOREIGN KEY/u);
         });
     });
+
+    // The README's query is the documented way to tell the three apart, so the
+    // test runs the README's own text rather than a copy that could drift.
+    it("the README's query separates never-echoed, never-injected and old-and-unknown", () => {
+        withV1Store(({ db, exec }) => {
+            const oldOnly = insertMemory(db, { uuid: "u-old" });
+            const neverEchoed = insertMemory(db, { uuid: "u-silent" });
+            const neverInjected = insertMemory(db, { uuid: "u-never" });
+            const echoedOnce = insertMemory(db, { uuid: "u-echoed" });
+
+            injected(db, [oldOnly]);
+            migrate(exec, readMigrations());
+
+            for (const echoedVerdict of ["echoed", "silent"]) {
+                const injectionId = injected(db, [neverEchoed, echoedOnce]);
+
+                insertEcho(db, injectionId, neverEchoed, { verdict: "silent", echoedTerms: 0 });
+                insertEcho(db, injectionId, echoedOnce, { verdict: echoedVerdict });
+            }
+
+            const rows = Object.fromEntries(db.query(readmeQuery()).all().map((row) => [row.id, row]));
+            const counts = (row) => ({ injected: row.injected, echoed: row.echoed, silent: row.silent, unknown: row.unknown });
+
+            assert.deepEqual(counts(rows[oldOnly]), { injected: 1, echoed: 0, silent: 0, unknown: 1 });
+            assert.deepEqual(counts(rows[neverEchoed]), { injected: 2, echoed: 0, silent: 2, unknown: 0 });
+            assert.deepEqual(counts(rows[neverInjected]), { injected: 0, echoed: 0, silent: 0, unknown: 0 });
+            assert.deepEqual(counts(rows[echoedOnce]), { injected: 2, echoed: 1, silent: 1, unknown: 0 });
+        });
+    });
 });
+
+/** The one SQL block under the README's "Whether a memory was any use". */
+const readmeQuery = () => {
+    const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+    const section = readme.slice(readme.indexOf("### Whether a memory was any use"));
+    const block = section.match(/```sql\n([\s\S]*?)```/u);
+
+    assert.ok(block !== null, "the README has a sql block under the usefulness section");
+
+    return block[1];
+};
 
 describe("two writers on one file", () => {
     it("loses nothing when two processes insert at once", async () => {

@@ -37,7 +37,7 @@ const STOPWORDS = new Set(
         "never next only other ought over same should since some something still such than that their theirs " +
         "them themselves then there these they thing things this those though through under until upon very " +
         "want well were what when where whether which while whom whose will with within without would your " +
-        "yours yourself sure okay yeah look looks looking think thanks please right let's"
+        "yours yourself sure okay yeah look looks looking think thanks please right"
     ).split(" "),
 );
 
@@ -77,9 +77,24 @@ const foldPlural = (word) => (word.length > MIN_TERM_CHARS && word.endsWith("s")
  * @param {string} writing What the turn wrote, from `turnWriting`.
  * @returns {{ verdict: "echoed" | "silent" | "indistinct", distinctTerms: number, echoedTerms: number, echoed: string[] }}
  */
-export const echoOf = (memory, prompt, writing) => {
+export const echoOf = (memory, prompt, writing) => scoreAgainst(memory, termsOf(prompt), termsOf(writing));
+
+/**
+ * Every injected memory's echo in one turn, the prompt and the writing split
+ * into words once for all of them.
+ *
+ * @param {{ memoryId: number, title?: unknown, body?: unknown }[]} memories
+ * @param {unknown} prompt
+ * @param {string} writing
+ */
+export const echoesOf = (memories, prompt, writing) => {
     const asked = termsOf(prompt);
     const written = termsOf(writing);
+
+    return memories.map((memory) => ({ memoryId: memory.memoryId, ...scoreAgainst(memory, asked, written) }));
+};
+
+const scoreAgainst = (memory, asked, written) => {
     const distinctive = [...termsOf(`${memory?.title ?? ""}\n${memory?.body ?? ""}`)].filter((term) => !asked.has(term));
     const echoed = distinctive.filter((term) => written.has(term)).sort();
 
@@ -101,8 +116,8 @@ const verdictFor = (distinctTerms, echoedTerms) => {
 
 /**
  * What the model wrote during the turn that just ended: every assistant text
- * and every string argument it passed to a tool, back to the prompt, then the
- * final answer.
+ * and every string it passed to a tool at any depth of its arguments, back to
+ * the prompt, then the final answer.
  *
  * Tool results are left out, because a file the model read is not a file the
  * model wrote, and so is the prompt, which already has its words subtracted. A
@@ -142,11 +157,24 @@ export const turnWriting = (messages, answer) => {
 const assistantWriting = (message) => {
     const text = typeof message?.text === "string" && message.text !== "" ? [message.text] : [];
     const uses = Array.isArray(message?.toolUses) ? message.toolUses : [];
-    const argumentsWritten = uses.flatMap((use) =>
-        use?.input !== null && typeof use?.input === "object"
-            ? Object.values(use.input).filter((value) => typeof value === "string" && value !== "")
-            : [],
-    );
+    const argumentsWritten = uses.flatMap((use) => stringsIn(use?.input));
 
     return [...text, ...argumentsWritten];
+};
+
+/** Every non-empty string in a tool's arguments, however deep: MultiEdit's `edits`, TodoWrite's `todos`, an MCP tool's objects. */
+const stringsIn = (value) => {
+    if (typeof value === "string") {
+        return value === "" ? [] : [value];
+    }
+
+    if (Array.isArray(value)) {
+        return value.flatMap(stringsIn);
+    }
+
+    if (value !== null && typeof value === "object") {
+        return Object.values(value).flatMap(stringsIn);
+    }
+
+    return [];
 };
