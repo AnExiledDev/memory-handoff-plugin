@@ -130,6 +130,150 @@ describe("the schema applies to an empty file", () => {
     });
 });
 
+describe("an older build opens a store a newer build migrated", () => {
+    /** A migration from past this build's newest, as the build that ships it would append it. */
+    const ahead = (version, minReader) => ({
+        name: `00${version}-ahead.sql`,
+        version,
+        minReader,
+        sql: `CREATE TABLE IF NOT EXISTS ahead_${version} (id INTEGER PRIMARY KEY, note TEXT NOT NULL);`,
+    });
+
+    const onlyVersion1 = () => readMigrations().filter((migration) => migration.version === 1);
+
+    const minReaderOf = (db) => db.query("SELECT version, min_reader FROM schema_meta WHERE id = 1").get();
+
+    /** A store a newer build migrated through `later` and wrote one memory into, closed before `run`. */
+    const withNewerStore = (later, run) => {
+        const dir = mkdtempSync(join(tmpdir(), "memory-handoff-newer-"));
+        const path = join(dir, "memory.sqlite");
+
+        try {
+            const newer = openMemoryDb(path);
+
+            try {
+                migrate(newer.exec, [...readMigrations(), ...later]);
+                insertMemory(newer.db, { uuid: "u-newer", body: "Written by the newer build before the older one opened the file." });
+            } finally {
+                newer.close();
+            }
+
+            return run(path);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    };
+
+    /** A version 1 store the way a build from before the minimum left it: no `min_reader` column at all. */
+    const withLegacyV1Store = async (run) => {
+        const dir = mkdtempSync(join(tmpdir(), "memory-handoff-legacy-"));
+        const path = join(dir, "memory.sqlite");
+        const db = new Database(path, { create: true });
+        const exec = { run: (sql) => db.exec(sql), get: (sql) => db.query(sql).get() ?? undefined };
+
+        try {
+            db.exec("PRAGMA journal_mode = WAL");
+            db.exec(onlyVersion1()[0].sql);
+
+            return await run({ db, exec, path });
+        } finally {
+            db.close();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    };
+
+    it("records with each migration the oldest schema version that can still use the store", () => {
+        withDb(({ db }) => {
+            assert.deepEqual(minReaderOf(db), { version: 2, min_reader: 1 });
+        });
+    });
+
+    it("records the minimum on a store that predates it once a migration runs there", async () => {
+        await withLegacyV1Store(({ db, exec }) => {
+            assert.deepEqual(migrate(exec, readMigrations()), { from: 1, to: 2, applied: ["002-injection-echoes.sql"] });
+            assert.deepEqual(minReaderOf(db), { version: 2, min_reader: 1 });
+        });
+    });
+
+    it("opens a store an additive migration moved past it, without migrating, and reads and writes memories", () => {
+        withNewerStore([ahead(3, 2)], (path) => {
+            const older = openMemoryDb(path);
+
+            try {
+                assert.deepEqual(older.migrated, { from: 3, to: 3, applied: [] });
+
+                const written = insertMemory(older.db, { uuid: "u-older", body: "Written by a build that has never heard of version three." });
+
+                assert.deepEqual(matches(older.db, "heard"), [written]);
+                assert.equal(matches(older.db, "newer").length, 1);
+                assert.equal(count(older.db, "memories"), 2);
+                assert.equal(count(older.db, "ahead_3"), 0);
+                assert.deepEqual(minReaderOf(older.db), { version: 3, min_reader: 2 });
+            } finally {
+                older.close();
+            }
+        });
+    });
+
+    it("lets a build that knows only version 1 open a store migrated to version 2", () => {
+        withDb(({ exec }) => {
+            assert.deepEqual(migrate(exec, onlyVersion1()), { from: 2, to: 2, applied: [] });
+        });
+    });
+
+    it("refuses a store a breaking migration moved past it, naming both versions", () => {
+        withNewerStore([ahead(3, 3)], (path) => {
+            assert.throws(() => openMemoryDb(path), /schema version 3 and the newest migration here is 2/u);
+        });
+    });
+
+    it("keeps refusing when an additive migration lands on top of a breaking one", () => {
+        withNewerStore([ahead(3, 3), ahead(4, 1)], (path) => {
+            assert.throws(() => openMemoryDb(path), /schema version 4 and the newest migration here is 2/u);
+        });
+    });
+
+    for (const [what, damage] of [
+        ["no minimum column", "ALTER TABLE schema_meta DROP COLUMN min_reader"],
+        ["a null minimum", "UPDATE schema_meta SET min_reader = NULL"],
+    ]) {
+        it(`treats a store with ${what} as usable only at its own version`, () => {
+            withDb(({ exec }) => {
+                exec.run(damage);
+
+                assert.throws(() => migrate(exec, onlyVersion1()), /schema version 2 and the newest migration here is 1/u);
+            });
+        });
+    }
+
+    it("refuses a migration whose minimum is not a version at or below its own", () => {
+        for (const minReader of [0, 4, 1.5]) {
+            withDb(({ exec }) => {
+                assert.throws(() => migrate(exec, [...readMigrations(), ahead(3, minReader)]), /minimum reader/u);
+                assert.equal(readVersion(exec), 2);
+            });
+        }
+    });
+
+    it("migrates a version 1 store once when several builds open it at the same moment", async () => {
+        await withLegacyV1Store(async ({ db, path }) => {
+            const writers = ["alpha", "beta", "gamma", "delta"].map((tag) =>
+                Bun.spawn(["bun", join(HERE, "concurrent-writer.js"), path, tag, "5"], { stdout: "pipe", stderr: "pipe" }),
+            );
+            const exits = await Promise.all(writers.map((writer) => writer.exited));
+            const errors = await Promise.all(writers.map((writer) => new Response(writer.stderr).text()));
+
+            assert.deepEqual(
+                errors.map((text) => text.trim()),
+                ["", "", "", ""],
+            );
+            assert.deepEqual(exits, [0, 0, 0, 0]);
+            assert.equal(count(db, "memories"), 20);
+            assert.deepEqual(minReaderOf(db), { version: 2, min_reader: 1 });
+        });
+    });
+});
+
 describe("FTS5 tracks the memories table through its triggers", () => {
     it("indexes an inserted memory and forgets a deleted one", () => {
         withDb(({ db, exec }) => {
