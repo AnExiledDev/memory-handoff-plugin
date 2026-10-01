@@ -46,10 +46,11 @@ export const defaultDbPath = (env = process.env) => {
 export const readMigrations = () => {
     const here = dirname(fileURLToPath(import.meta.url));
 
-    return MIGRATION_FILES.map((name) => ({
+    return MIGRATION_FILES.map(({ name, minReader }) => ({
         name,
         version: migrationVersion(name),
         sql: readFileSync(join(here, name), "utf8"),
+        minReader,
     }));
 };
 

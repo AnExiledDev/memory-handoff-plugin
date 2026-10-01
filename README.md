@@ -412,7 +412,8 @@ have to be able to write.
 
 The schema is `schema/001-initial.sql` plus the migrations after it, and ten tables:
 
-- `schema_meta`, one row, the schema version the file is at.
+- `schema_meta`, one row, the schema version the file is at and the oldest
+  schema version a build can be and still use it (`min_reader`).
 - `memories`, the memories themselves and the metadata every filter reads.
 - `memories_fts`, an FTS5 index over `title` and `body` only, external content
   over `memories`, kept in step by three triggers. The documented query shape
@@ -475,10 +476,33 @@ dependency is not here yet.
 
 **Migrations are forward-only.** `schema_meta.version` says where a database is,
 `schema/migrate.js` applies every `NNN-*.sql` above it in one transaction each,
-and a database at a version newer than the newest file on disk is refused rather
-than downgraded. `migrate.js` takes a port, `{ run(sql), get(sql) }`, and knows
-about no driver and no filesystem; `schema/bun-sqlite.js` is the one adapter and
-holds all of both.
+and a database is never downgraded. `migrate.js` takes a port, `{ run(sql),
+get(sql) }`, and knows about no driver and no filesystem; `schema/bun-sqlite.js`
+is the one adapter and holds all of both.
+
+**An older build keeps working on a newer store unless the newer schema says it
+cannot.** A session keeps the plugin build it started with until it restarts, so
+after an upgrade an old and a new build share one file, and the first new
+session to open it migrates it. Each entry in `MIGRATION_FILES` declares a
+`minReader`, the oldest schema version whose build can still read and write the
+store once that migration has run, and the migration records it in
+`schema_meta.min_reader`. A build whose newest migration is at or above that
+number opens a newer store as it is, migrating nothing, and reads and writes the
+tables it knows; a build below it is refused with both versions in the message.
+The recorded number only rises, so an additive migration on top of a breaking
+one does not reopen the store to the builds the break shut out. A store with no
+recorded minimum, which is every store last migrated before this existed, is
+treated as needing its own version.
+
+When writing a migration, `minReader` stays where it was only if every older
+build's statements still succeed against the new schema: a new table, a new
+index, or a column that is nullable or has a default. Anything an older build
+would trip over sets it to the migration's own version: a renamed or dropped
+table or column, a new `NOT NULL` column without a default, a tighter `CHECK`,
+or a trigger that refuses a write an older build makes. Migration 002 only adds
+`injection_echoes`, so it declares 1. Builds from before this rule (0.10.0 and
+earlier) still refuse any store newer than they are; this protects the next
+schema bump onwards, once running sessions are on a build that has it.
 
 `bun schema/smoke.js [path]` is the runnable check: a fresh file, two memories,
 an FTS5 match, both vector dtypes, a supersede, a generation with its cost, a
